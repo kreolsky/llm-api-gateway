@@ -6,7 +6,8 @@ so the request path never re-validates and never sees a malformed entry.
 Two validation classes, matching what a hot reload may do to a running router:
 
   soft — warn, never veto a reload: the per-model ``reasoning_effort`` block,
-      ``model_info`` entries/keys and non-numeric pricing values (dropped),
+      ``model_info`` entries/keys (incl. the anthropic compat allow-list,
+      ``ANTHROPIC_COMPAT_KEYS``) and non-numeric pricing values (dropped),
       and dangling cross-file references — a model whose ``provider`` is not
       a providers.yaml key, a key whose ``allowed_models`` names an unknown
       model (kept; the request path answers them);
@@ -324,15 +325,29 @@ def _parse_pricing(model_id: str, pricing: Any) -> dict[str, float] | None:
     return parsed
 
 
-def _parse_compat(model_id: str, compat: Any) -> dict[str, bool | int | str] | None:
+# Compat keys an anthropic-type model_info entry may carry.
+# INVARIANT: the allow-list is exactly the `offer` set of dsh's ANTHROPIC_COMPAT_GATE (lore-knowledge-creator
+# vendor/dsh/packages/llm/llm-pi-ai/src/catalog.ts) — the router never vetoes an offered key on its own policy; a key present in config works.
+# Why: the operator alone decides via config (e.g. 1h cache retention is allowed even though /stat under-reports its writes — accepted, model_info.yaml header).
+# Re-diff against that gate whenever Lore bumps its dsh or pi-ai pin.
+ANTHROPIC_COMPAT_KEYS = frozenset({
+    "forceAdaptiveThinking", "supportsStrictTools", "supportsEagerToolInputStreaming",
+    "supportsCacheControlOnTools", "supportsTemperature", "allowEmptySignature",
+    "supportsLongCacheRetention",
+})
+
+
+def _parse_compat(model_id: str, compat: Any,
+                  provider_type: str | None) -> dict[str, bool | int | str] | None:
     """Normalize one model_info compat block: string keys -> scalar values.
 
     ``compat`` carries pi-ai compatibility flags (/v1/models renders it as
     stored for anthropic-type models). Manual-only and hand-authored, so it is
     soft-validated like the other model_info keys: a non-mapping drops the
-    whole block; a non-string key or a non-scalar value (list/dict/None) drops
-    just that entry — each with a warning naming the model. Returns None for a
-    non-mapping so the caller drops the whole key.
+    whole block; a non-string key, a non-scalar value (list/dict/None) or —
+    on an anthropic-type model — a key outside ANTHROPIC_COMPAT_KEYS drops
+    just that entry — each with a warning naming the model. Returns None for
+    a non-mapping so the caller drops the whole key.
     """
     if not isinstance(compat, dict):
         logger.warning(
@@ -349,14 +364,23 @@ def _parse_compat(model_id: str, compat: Any) -> dict[str, bool | int | str] | N
                 extra={"config": {"model_info_key": model_id, "compat_key": key}},
             )
             continue
+        if provider_type == "anthropic" and key not in ANTHROPIC_COMPAT_KEYS:
+            logger.warning(
+                f"model_info entry '{model_id}' compat key {key!r} is not in the "
+                f"anthropic allow-list (ANTHROPIC_COMPAT_KEYS), ignoring it",
+                extra={"config": {"model_info_key": model_id, "compat_key": key}},
+            )
+            continue
         parsed[key] = value
     return parsed
 
 
-def _normalize_model_info_entry(model_id: str, entry: dict[str, Any]) -> dict[str, Any]:
+def _normalize_model_info_entry(model_id: str, entry: dict[str, Any],
+                                provider_type: str | None) -> dict[str, Any]:
     """Normalize one KEPT model_info entry: pricing to floats, compat to
-    scalars. Returns a COPY whenever anything changed — the raw dict belongs
-    to the caller and is never mutated.
+    scalars (allow-listed keys only on anthropic-type models). Returns a COPY
+    whenever anything changed — the raw dict belongs to the caller and is
+    never mutated.
     """
     if "pricing" in entry:
         parsed = _parse_pricing(model_id, entry["pricing"])
@@ -366,7 +390,7 @@ def _normalize_model_info_entry(model_id: str, entry: dict[str, Any]) -> dict[st
         else:
             entry["pricing"] = parsed
     if "compat" in entry:
-        parsed_compat = _parse_compat(model_id, entry["compat"])
+        parsed_compat = _parse_compat(model_id, entry["compat"], provider_type)
         entry = dict(entry)
         if parsed_compat:
             entry["compat"] = parsed_compat
@@ -377,14 +401,54 @@ def _normalize_model_info_entry(model_id: str, entry: dict[str, Any]) -> dict[st
     return entry
 
 
-def _parse_model_info(model_info: Any, models: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+def _resolve_provider_types(models: Mapping[str, ModelEntry],
+                            providers: Mapping[str, ProviderEntry]) -> dict[str, str]:
+    """Map each model id to its provider's type. A model is left out when its
+    ``provider`` is None or the provider is absent from providers.yaml (each
+    already warned elsewhere) — "not anthropic" for every consumer below."""
+    resolved: dict[str, str] = {}
+    for model_id, entry in models.items():
+        if entry.provider is None:
+            continue
+        provider = providers.get(entry.provider)
+        if provider is None:
+            continue
+        resolved[model_id] = provider.type
+    return resolved
+
+
+def _warn_anthropic_checklist(provider_types: Mapping[str, str],
+                              model_info: Mapping[str, Mapping[str, Any]]) -> None:
+    """Warn for every anthropic-type MODEL whose kept model_info entry lacks
+    context_length or max_completion_tokens — the keys a /v1/models consumer
+    (Lore's pi-ai) needs on the anthropic wire and the auto-cache does not
+    fill; missing, the client silently falls back to a 128k window. Iterates
+    models, not model_info entries, so a model with no entry at all warns for
+    both keys. Soft, like every model_info check."""
+    for model_id, provider_type in provider_types.items():
+        if provider_type != "anthropic":
+            continue
+        entry = model_info.get(model_id, {})
+        for key in ("context_length", "max_completion_tokens"):
+            if key not in entry:
+                logger.warning(
+                    f"anthropic checklist: model '{model_id}' has no model_info "
+                    f"'{key}' (a /v1/models consumer falls back to defaults; "
+                    f"see config/model_info.yaml header)",
+                    extra={"config": {"model_info_key": model_id, "checklist_key": key}},
+                )
+
+
+def _parse_model_info(model_info: Any, models: Mapping[str, Any],
+                      provider_types: Mapping[str, str]) -> dict[str, dict[str, Any]]:
     """Soft-validate model_info: warn on unknown keys and orphan entries.
 
     Non-fatal (model_info is optional). Warns when an entry has no
     matching model in models.yaml, or uses keys outside the normalized
     schema — both indicate a stale or mistyped catalog. A non-mapping entry
     is dropped. Pricing values are normalized to floats via _parse_pricing
-    (PyYAML can hand a numeric string where a number is meant).
+    (PyYAML can hand a numeric string where a number is meant); compat is
+    filtered to ANTHROPIC_COMPAT_KEYS on anthropic-type models.
     """
     if not isinstance(model_info, dict):
         return {}
@@ -416,7 +480,8 @@ def _parse_model_info(model_info: Any, models: Mapping[str, Any]) -> dict[str, d
                     f"model_info entry '{model_id}'.architecture has unknown keys: {sorted(arch_unknown)}",
                     extra={"config": {"model_info_key": model_id, "unknown_keys": sorted(arch_unknown)}},
                 )
-        kept[model_id] = _normalize_model_info_entry(model_id, entry)
+        kept[model_id] = _normalize_model_info_entry(model_id, entry,
+                                                     provider_types.get(model_id))
     return kept
 
 
@@ -485,9 +550,12 @@ def parse_config(raw: Mapping[str, Any]) -> RouterConfig:
     if errors:
         raise ConfigError("Invalid configuration:\n" + "\n".join(errors))
     _warn_dangling_references(providers, models, user_keys)
+    provider_types = _resolve_provider_types(models, providers)
+    model_info = _parse_model_info(raw.get("model_info"), models, provider_types)
+    _warn_anthropic_checklist(provider_types, model_info)
     return RouterConfig(
         providers=providers,
         models=models,
         user_keys=user_keys,
-        model_info=_parse_model_info(raw.get("model_info"), models),
+        model_info=model_info,
     )

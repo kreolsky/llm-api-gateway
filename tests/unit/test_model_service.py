@@ -717,9 +717,12 @@ class TestApiField:
 
     @pytest.mark.asyncio
     async def test_compat_rendered_as_stored(self):
-        """model_info compat (manual-only) renders verbatim on /v1/models."""
-        compat = {"forceAdaptiveThinking": True, "supportsMidConvoEffort": True,
-                  "title": "deep thinker"}
+        """model_info compat (manual-only) renders verbatim on /v1/models.
+        The payload is allow-list keys with mixed scalar types: parsing must
+        keep each as authored and rendering must not touch them (anthropic
+        models only carry ANTHROPIC_COMPAT_KEYS keys — filtered at parse)."""
+        compat = {"forceAdaptiveThinking": True, "supportsStrictTools": False,
+                  "allowEmptySignature": "yes"}
         models = {"anthropic/model": {"provider": "prov-an"}}
         model_info = {"anthropic/model": {"compat": compat}}
         svc = _build_service(models=models, providers=_ANTHROPIC_PROVIDERS,

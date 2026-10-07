@@ -1,5 +1,6 @@
 """Unit tests for src/core/config_manager.py — ConfigManager class."""
 
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -369,6 +370,152 @@ class TestModelInfoCompat:
             config = self._model_info_config(["flag"])
         assert "compat" not in config.model_info["m"]
         assert mock_logger.warning.called
+
+
+class TestAnthropicCompatAllowList:
+    """compat on an anthropic-type model is filtered to dsh's offered set
+    (ANTHROPIC_COMPAT_KEYS — the anthropic-messages ANTHROPIC_COMPAT_GATE
+    `offer` keys): a key outside the set is warned and dropped, because dsh
+    fails a model's resolution on a withheld key, an unknown key, or a key
+    offered only by another protocol. On any other provider type compat is
+    kept as stored (TestModelInfoCompat pins that branch)."""
+
+    OFFERED = {
+        "forceAdaptiveThinking": True,
+        "supportsStrictTools": True,
+        "supportsEagerToolInputStreaming": True,
+        "supportsCacheControlOnTools": True,
+        "supportsTemperature": True,
+        "allowEmptySignature": True,
+        "supportsLongCacheRetention": True,
+    }
+    DROPPED = {
+        "supportsMidConvoEffort": True,      # withheld by the gate
+        "supportsDeveloperRole": True,       # offered only on openai-completions
+        "forceAdaptiveThinkng": True,        # typo
+    }
+
+    def _parse(self, provider_type="anthropic", model_info=None, models=None, providers=None):
+        from src.core.config_schema import parse_config
+        raw = {
+            "providers": providers if providers is not None else {"p": {"type": provider_type}},
+            "models": models if models is not None else {"m": {"provider": "p"}},
+        }
+        if model_info is not None:
+            raw["model_info"] = model_info
+        with patch("src.core.config_schema.logger") as mock_logger:
+            config = parse_config(raw)
+        return config, mock_logger
+
+    @staticmethod
+    def _warnings(mock_logger):
+        return [c[0][0] for c in mock_logger.warning.call_args_list]
+
+    @classmethod
+    def _checklist_warnings(cls, mock_logger):
+        return [w for w in cls._warnings(mock_logger) if "checklist" in w]
+
+    def test_every_offered_key_kept_without_warning(self):
+        entry = {"context_length": 524288, "max_completion_tokens": 131072,
+                 "compat": dict(self.OFFERED)}
+        config, mock_logger = self._parse(model_info={"m": entry})
+        assert config.model_info["m"]["compat"] == self.OFFERED
+        assert mock_logger.warning.call_args_list == []
+
+    def test_withheld_foreign_and_typo_keys_dropped_with_warning(self):
+        compat = {"forceAdaptiveThinking": True, **self.DROPPED}
+        config, mock_logger = self._parse(
+            model_info={"m": {"context_length": 1, "max_completion_tokens": 1,
+                              "compat": compat}})
+        assert config.model_info["m"]["compat"] == {"forceAdaptiveThinking": True}
+        for key in self.DROPPED:
+            assert any(key in w and "'m'" in w for w in self._warnings(mock_logger)), key
+
+    def test_compat_whose_every_key_dropped_disappears(self):
+        config, _ = self._parse(
+            model_info={"m": {"context_length": 1, "max_completion_tokens": 1,
+                              "compat": {"supportsMidConvoEffort": True}}})
+        assert "compat" not in config.model_info["m"]
+
+    def test_same_keys_on_openai_provider_kept_without_warning(self):
+        compat = {"forceAdaptiveThinking": True, **self.DROPPED}
+        config, mock_logger = self._parse(
+            provider_type="openai", model_info={"m": {"compat": compat}})
+        assert config.model_info["m"]["compat"] == compat
+        assert mock_logger.warning.call_args_list == []
+
+    # -- checklist: context_length / max_completion_tokens on anthropic models
+
+    def test_missing_context_length_warns_once(self):
+        _, mock_logger = self._parse(
+            model_info={"m": {"max_completion_tokens": 4096}})
+        checklist = self._checklist_warnings(mock_logger)
+        assert len(checklist) == 1
+        assert "'m'" in checklist[0] and "context_length" in checklist[0]
+
+    def test_no_model_info_entry_warns_for_both_keys(self):
+        _, mock_logger = self._parse()  # no model_info section at all
+        checklist = self._checklist_warnings(mock_logger)
+        assert len(checklist) == 2
+        assert any("context_length" in w for w in checklist)
+        assert any("max_completion_tokens" in w for w in checklist)
+
+    def test_complete_anthropic_entry_no_checklist_warning(self):
+        _, mock_logger = self._parse(
+            model_info={"m": {"context_length": 524288, "max_completion_tokens": 131072}})
+        assert self._checklist_warnings(mock_logger) == []
+
+    def test_incomplete_entry_on_openai_no_checklist_warning(self):
+        _, mock_logger = self._parse(
+            provider_type="openai", model_info={"m": {"max_completion_tokens": 4096}})
+        assert self._checklist_warnings(mock_logger) == []
+
+    def test_orphan_entry_no_checklist_warning(self):
+        # 'ghost' is not a models.yaml model: the existing orphan warning fires,
+        # but the checklist iterates MODELS, never model_info entries.
+        _, mock_logger = self._parse(
+            model_info={"m": {"context_length": 1, "max_completion_tokens": 1},
+                        "ghost": {"max_completion_tokens": 1}})
+        assert self._checklist_warnings(mock_logger) == []
+        assert any("ghost" in w for w in self._warnings(mock_logger))
+
+    def test_provider_none_model_no_checklist_warning(self):
+        _, mock_logger = self._parse(
+            models={"m": {"provider": None}},
+            model_info={"m": {"max_completion_tokens": 1}})
+        assert self._checklist_warnings(mock_logger) == []
+
+    def test_unknown_provider_model_no_checklist_warning(self):
+        # 'ghost' provider is not in providers.yaml — _warn_dangling_references
+        # owns that warning; the checklist treats the model as not typed.
+        _, mock_logger = self._parse(
+            models={"m": {"provider": "ghost"}},
+            providers={"p": {"type": "anthropic"}},
+            model_info={"m": {"max_completion_tokens": 1}})
+        assert self._checklist_warnings(mock_logger) == []
+        assert any("unknown provider 'ghost'" in w for w in self._warnings(mock_logger))
+
+    def test_repo_configs_parse_with_compat_and_no_warnings(self):
+        """The repo's own config files: deepseek-a/flash carries the
+        production-settled compat line and numbers, and loading them logs no
+        compat or checklist warning."""
+        from src.core.config_schema import parse_config
+        base = Path(__file__).resolve().parents[2] / "config"
+        raw = {}
+        for fname, key in (("providers.yaml", "providers"), ("models.yaml", "models"),
+                           ("user_keys.yaml", "user_keys"), ("model_info.yaml", "model_info")):
+            with open(base / fname) as f:
+                loaded = yaml.safe_load(f) or {}
+            raw[key] = loaded.get(key) or {}
+        with patch("src.core.config_schema.logger") as mock_logger:
+            config = parse_config(raw)
+        entry = config.model_info["deepseek-a/flash"]
+        assert entry["compat"] == {"forceAdaptiveThinking": True}
+        assert entry["context_length"] == 524288
+        assert entry["max_completion_tokens"] == 131072
+        offenders = [w for w in self._warnings(mock_logger)
+                     if "compat" in w or "checklist" in w]
+        assert offenders == []
 
 
 class TestCrossReferenceWarnings:
