@@ -11,6 +11,15 @@ models:
     reasoning_effort:
       allowed: [low, high, max]
       param: reasoning_effort
+  deepseek-a/flash:
+    provider: deepseek-anthropic
+    provider_model_name: deepseek-v4-flash
+    # Advertisement only on the Anthropic wire: /v1/capabilities and /v1/models
+    # render these effort_levels, but nothing is gated or injected on
+    # /v1/messages (the policy gate is OpenAI-wire surgery). `param` is
+    # ignored for anthropic-type models.
+    reasoning_effort:
+      allowed: [low, high, max]
   gemini/mini:
     provider: openrouter
     provider_model_name: google/gemini-3.5-flash-lite

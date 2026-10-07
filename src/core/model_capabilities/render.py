@@ -18,6 +18,7 @@ PRICING_KEYS = (
     "web_search",
     "internal_reasoning",
     "input_cache_read",
+    "input_cache_write",
 )
 
 

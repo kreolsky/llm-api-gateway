@@ -3,15 +3,135 @@
 
 import json
 import time
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 from dataclasses import dataclass
 from typing import Any
 
 from fastapi import HTTPException
 
 from ...core.error_handling import enrich_stats_from_envelope, log_provider_error
+from ...core.error_handling.anthropic import anthropic_error_type
 from ...core.logging import logger
 from ...core.usage_db import RequestStats
+
+
+@dataclass(frozen=True)
+class StreamWire:
+    """Per-protocol behavior of the SSE pass-through.
+
+    ARCH: chunks are forwarded byte-for-byte on every wire; what varies is
+    (a) the byte gate + parser that captures usage frames, (b) the stats
+    recorder for the captured usage shape (OpenAI tokens vs Anthropic
+    input/output), (c) the mid-stream router-failure frame, and (d) whether
+    the reasoning->reasoning_content duplication applies (it is OpenAI-wire
+    shaped: choices/delta/message holders). Frozen on purpose: a wire is
+    protocol knowledge, not per-stream state.
+    """
+    chunk_may_carry_usage: Callable[[bytes], bool]
+    capture_usage: Callable[[bytes, dict[str, Any]], None]
+    record_usage: Callable[[RequestStats, dict[str, Any]], None]
+    frame_error: Callable[[dict[str, Any]], bytes]
+    remap_reasoning: bool
+
+
+def _frame_anthropic_error(error_payload: dict[str, Any]) -> bytes:
+    """Frame a router failure as an Anthropic error event.
+
+    WHY no [DONE] sentinel here: that is an OpenAI-wire convention; the
+    Anthropic wire terminates a failed stream with the error event alone.
+    """
+    error = error_payload.get("error") or {}
+    status_code = error.get("code") if isinstance(error.get("code"), int) else 500
+    payload = {
+        "type": "error",
+        "error": {"type": anthropic_error_type(status_code),
+                  "message": str(error.get("message") or "stream failed")},
+    }
+    return f"event: error\ndata: {json.dumps(payload)}\n\n".encode()
+
+
+def _openai_chunk_may_carry_usage(chunk: bytes) -> bool:
+    return b'"usage"' in chunk and b'"prompt_tokens"' in chunk
+
+
+def _anthropic_chunk_may_carry_usage(chunk: bytes) -> bool:
+    return b'"input_tokens"' in chunk or b'"output_tokens"' in chunk
+
+
+def _capture_usage_from_chunk(chunk: bytes, captured_usage: dict[str, Any]) -> None:
+    """Parse usage out of a transparent-mode chunk, writing into the holder."""
+    try:
+        text = chunk.decode('utf-8')
+        for line in text.split('\n'):
+            if line.startswith('data: ') and line != 'data: [DONE]':
+                data = json.loads(line[6:])
+                if 'usage' in data:
+                    captured_usage["usage"] = data['usage']
+    except Exception:
+        pass
+
+
+def _capture_anthropic_usage_from_chunk(chunk: bytes, captured_usage: dict[str, Any]) -> None:
+    """Capture Anthropic-wire usage from complete ``data:`` lines.
+
+    ``message_start`` carries usage under ``message.usage`` and
+    ``message_delta`` at the top level (observed on DeepSeek: both carry the
+    full set). Merged key by key into the holder — later frames win, so the
+    final ``message_delta`` numbers are recorded. Best-effort like the OpenAI
+    capture: a line split across chunks is not parsed.
+    """
+    try:
+        text = chunk.decode('utf-8')
+    except UnicodeDecodeError:
+        return
+    for line in text.split('\n'):
+        line = line.rstrip('\r')
+        if not line.startswith('data: '):
+            continue
+        try:
+            payload = json.loads(line[6:])
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        usage = None
+        if payload.get("type") == "message_start":
+            message = payload.get("message")
+            usage = message.get("usage") if isinstance(message, dict) else None
+        elif payload.get("type") == "message_delta":
+            usage = payload.get("usage")
+        if isinstance(usage, dict):
+            merged = dict(captured_usage.get("usage") or {})
+            merged.update(usage)
+            captured_usage["usage"] = merged
+
+
+def _frame_error(error_payload: dict[str, Any]) -> bytes:
+    """Frame an error payload as SSE data.
+
+    WHY: many OpenAI-compatible clients block until they see [DONE]; an
+    error frame alone leaves them waiting until the read timeout fires.
+    """
+    return f"data: {json.dumps(error_payload)}\n\ndata: [DONE]\n\n".encode()
+
+
+# The two wires, built here (after their helpers) so every reference is a
+# direct name and OPENAI_STREAM can serve as a default argument below.
+OPENAI_STREAM = StreamWire(
+    chunk_may_carry_usage=_openai_chunk_may_carry_usage,
+    capture_usage=_capture_usage_from_chunk,
+    record_usage=RequestStats.set_usage,
+    frame_error=_frame_error,
+    remap_reasoning=True,
+)
+
+ANTHROPIC_STREAM = StreamWire(
+    chunk_may_carry_usage=_anthropic_chunk_may_carry_usage,
+    capture_usage=_capture_anthropic_usage_from_chunk,
+    record_usage=RequestStats.set_anthropic_usage,
+    frame_error=_frame_anthropic_error,
+    remap_reasoning=False,
+)
 
 
 def duplicate_reasoning_field(data: Any) -> bool:
@@ -89,18 +209,20 @@ async def process_stream(provider_stream: AsyncGenerator[bytes, None],
                          request_id: str,
                          user_id: str,
                          provider_name: str,
-                         stats: RequestStats) -> AsyncGenerator[bytes, None]:
+                         stats: RequestStats,
+                         wire: StreamWire = OPENAI_STREAM) -> AsyncGenerator[bytes, None]:
     """Forward a provider SSE stream byte-for-byte (logging, usage capture,
-    error framing).
+    error framing) for one wire (OPENAI_STREAM by default, ANTHROPIC_STREAM
+    for the Messages protocol).
 
     Holds no state across calls: captured usage lives in a per-stream holder,
     so concurrent streams never affect each other.
 
     The per-request RequestStats holder is enriched in place: mid-stream
     failures write error_code/error_message from the same payload as the
-    SSE error frame (so the frame and the row cannot drift), and set_usage
-    runs in a ``finally`` so the error path and a client disconnect keep
-    partial usage.
+    wire's error frame (so the frame and the row cannot drift), and the
+    captured usage is recorded in a ``finally`` so the error path and a
+    client disconnect keep partial usage.
     """
     captured_usage: dict[str, Any] = {}
     chunk_stats = _StreamStats()
@@ -114,14 +236,14 @@ async def process_stream(provider_stream: AsyncGenerator[bytes, None],
     })
 
     try:
-        async for chunk in _passthrough(provider_stream, captured_usage, chunk_stats, ctx):
+        async for chunk in _passthrough(provider_stream, captured_usage, chunk_stats, ctx, wire):
             yield chunk
     except Exception as e:
-        yield _stream_failure(e, ctx, chunk_stats, start_time)
+        yield _stream_failure(e, ctx, chunk_stats, start_time, wire)
         return
     finally:
         if captured_usage.get("usage"):
-            stats.set_usage(captured_usage["usage"])
+            wire.record_usage(stats, captured_usage["usage"])
 
     logger.info("Stream completed", extra={
             "request_id": request_id,
@@ -131,7 +253,7 @@ async def process_stream(provider_stream: AsyncGenerator[bytes, None],
 
 
 def _stream_failure(e: Exception, ctx: "_StreamContext", chunk_stats: "_StreamStats",
-                    start_time: float) -> bytes:
+                    start_time: float, wire: StreamWire) -> bytes:
     """Log a mid-stream failure, record it on the stats row, return its SSE frame."""
     logger.error("Stream processing failed", extra={
         "request_id": ctx.request_id,
@@ -146,21 +268,23 @@ def _stream_failure(e: Exception, ctx: "_StreamContext", chunk_stats: "_StreamSt
     }, exc_info=True)
     error_payload = _error_payload(e)
     # The ONE envelope extractor (core/error_handling/envelope.py),
-    # shared with the HTTP exception handler: the frame the client
-    # sees and the row the dashboard sees cannot drift.
+    # shared with the HTTP exception handler: the row the dashboard
+    # sees and the frame the client sees cannot drift. Enrichment reads
+    # the OpenRouter envelope on BOTH wires; only the frame is wire-shaped.
     # overwrite=True: this payload is the terminal error for the
     # request, so it owns error_code/error_message outright.
     enrich_stats_from_envelope(
         ctx.req_stats, error_payload,
         default_error_code="internal_server_error", overwrite=True,
     )
-    return _frame_error(error_payload)
+    return wire.frame_error(error_payload)
 
 
 async def _passthrough(provider_stream: AsyncGenerator[bytes, None],
                        captured_usage: dict[str, Any],
                        stats: "_StreamStats",
-                       ctx: "_StreamContext") -> AsyncGenerator[bytes, None]:
+                       ctx: "_StreamContext",
+                       wire: StreamWire = OPENAI_STREAM) -> AsyncGenerator[bytes, None]:
     """Forward chunks unchanged, only peeking for reasoning fields, usage
     and upstream error frames.
 
@@ -176,7 +300,7 @@ async def _passthrough(provider_stream: AsyncGenerator[bytes, None],
             preview = chunk.decode('utf-8', errors='replace')[:200].replace('\n', '\\n')
             logger.debug(f"Chunk {stats.chunks} ({len(chunk)}B): {preview}", request_id=ctx.request_id)
 
-        if b'"reasoning"' in chunk:
+        if wire.remap_reasoning and b'"reasoning"' in chunk:
             chunk = _remap_reasoning_in_chunk(chunk)
 
         # INVARIANT: the chunk is yielded before the usage and error peeks and
@@ -185,8 +309,8 @@ async def _passthrough(provider_stream: AsyncGenerator[bytes, None],
         # own error text and framing; these peeks only log and record.
         yield chunk
 
-        if b'"usage"' in chunk and b'"prompt_tokens"' in chunk:
-            _capture_usage_from_chunk(chunk, captured_usage)
+        if wire.chunk_may_carry_usage(chunk):
+            wire.capture_usage(chunk, captured_usage)
 
         if b'"error"' in chunk:
             _note_upstream_error(chunk, ctx)
@@ -245,19 +369,6 @@ def _note_upstream_error(chunk: bytes, ctx: _StreamContext) -> None:
         )
 
 
-def _capture_usage_from_chunk(chunk: bytes, captured_usage: dict[str, Any]) -> None:
-    """Parse usage out of a transparent-mode chunk, writing into the holder."""
-    try:
-        text = chunk.decode('utf-8')
-        for line in text.split('\n'):
-            if line.startswith('data: ') and line != 'data: [DONE]':
-                data = json.loads(line[6:])
-                if 'usage' in data:
-                    captured_usage["usage"] = data['usage']
-    except Exception:
-        pass
-
-
 def _remap_reasoning_in_chunk(chunk: bytes) -> bytes:
     """Best-effort reasoning->reasoning_content duplication for a raw transparent-mode chunk.
 
@@ -312,12 +423,3 @@ def _error_payload(error: Exception) -> dict[str, Any]:
             "message": f"An unexpected error occurred during streaming: {error}"
         }
     }
-
-
-def _frame_error(error_payload: dict[str, Any]) -> bytes:
-    """Frame an error payload as SSE data.
-
-    WHY: many OpenAI-compatible clients block until they see [DONE]; an
-    error frame alone leaves them waiting until the read timeout fires.
-    """
-    return f"data: {json.dumps(error_payload)}\n\ndata: [DONE]\n\n".encode()

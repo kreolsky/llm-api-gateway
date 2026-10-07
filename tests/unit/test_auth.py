@@ -104,6 +104,47 @@ class TestNonAsciiBearer:
         assert json.loads(body)["error"]["metadata"]["error_code"] == "missing_api_key"
 
 
+class TestXApiKey:
+    """x-api-key as a client credential (the Anthropic SDK inside pi-ai sends
+    it): accepted on every route when no Bearer is present, Bearer wins when
+    both are sent."""
+
+    @pytest.mark.asyncio
+    async def test_valid_x_api_key_grants(self, app):
+        status, body, raised = await _drive(app, [(b"x-api-key", b"nnp-v1-valid-key")])
+        assert raised is None
+        assert status == 200
+        assert json.loads(body) == {"user": "lab"}
+
+    @pytest.mark.asyncio
+    async def test_invalid_x_api_key_is_401(self, app):
+        status, body, _ = await _drive(app, [(b"x-api-key", b"nnp-v1-wrong")])
+        assert status == 401
+        assert json.loads(body)["error"]["metadata"]["error_code"] == "invalid_api_key"
+
+    @pytest.mark.asyncio
+    async def test_bearer_wins_over_x_api_key(self, app):
+        """A valid Bearer plus a junk x-api-key authenticates via the Bearer."""
+        status, body, raised = await _drive(app, [
+            (b"authorization", b"Bearer nnp-v1-valid-key"),
+            (b"x-api-key", b"junk"),
+        ])
+        assert raised is None
+        assert status == 200
+        assert json.loads(body) == {"user": "lab"}
+
+    @pytest.mark.asyncio
+    async def test_x_api_key_not_considered_when_bearer_present(self, app):
+        """A missing/invalid Bearer does not fall back to x-api-key: the
+        Bearer header declares the credential scheme being used."""
+        status, body, _ = await _drive(app, [
+            (b"authorization", b"Bearer nnp-v1-wrong"),
+            (b"x-api-key", b"nnp-v1-valid-key"),
+        ])
+        assert status == 401
+        assert json.loads(body)["error"]["metadata"]["error_code"] == "invalid_api_key"
+
+
 def _guarded_app(key: str, allowed_endpoints: list[str] | None) -> FastAPI:
     """App whose /guarded route is protected by check_endpoint_access.
 

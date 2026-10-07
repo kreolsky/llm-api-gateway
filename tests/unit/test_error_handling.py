@@ -10,6 +10,56 @@ from src.core.error_handling.error_handler import create_error
 from src.core.error_handling.error_types import ErrorType
 
 # ---------------------------------------------------------------------------
+# Anthropic error conversion (/v1/messages response shape)
+# ---------------------------------------------------------------------------
+
+class TestAnthropicErrorConversion:
+    """One converter (core/error_handling/anthropic.py) serves the HTTP
+    handlers and the SSE failure frame — status -> Anthropic error type."""
+
+    @pytest.mark.parametrize("status_code, expected_type", [
+        (400, "invalid_request_error"),
+        (401, "authentication_error"),
+        (403, "permission_error"),
+        (404, "not_found_error"),
+        (413, "request_too_large"),
+        (429, "rate_limit_error"),
+        (503, "overloaded_error"),
+        (529, "overloaded_error"),
+        (500, "api_error"),
+        (502, "api_error"),
+        (418, "api_error"),
+        (None, "api_error"),
+    ])
+    def test_status_to_type_map(self, status_code, expected_type):
+        from src.core.error_handling.anthropic import anthropic_error_type
+        assert anthropic_error_type(status_code) == expected_type
+
+    def test_every_error_type_status_maps_without_raising(self):
+        """Walking EVERY ErrorType status through the converter: the handler
+        renders any router error on /v1/messages, so an exotic status must
+        never raise — worst case it is an api_error."""
+        from src.core.error_handling.anthropic import anthropic_error_type
+        for member in ErrorType:
+            assert isinstance(anthropic_error_type(member.status_code), str)
+
+    def test_payload_shape(self):
+        from src.core.error_handling.anthropic import anthropic_error_payload
+        assert anthropic_error_payload(401, "bad key") == {
+            "type": "error",
+            "error": {"type": "authentication_error", "message": "bad key"},
+        }
+
+    def test_from_envelope_keeps_message(self):
+        from src.core.error_handling.anthropic import anthropic_error_from_envelope
+        out = anthropic_error_from_envelope(429, {
+            "error": {"code": 429, "message": "rate limited",
+                      "metadata": {"error_code": "provider_http_error"}}})
+        assert out["error"]["type"] == "rate_limit_error"
+        assert out["error"]["message"] == "rate limited"
+
+
+# ---------------------------------------------------------------------------
 # ErrorType enum
 # ---------------------------------------------------------------------------
 
@@ -21,6 +71,7 @@ class TestErrorTypeEnumValues:
         [
             (ErrorType.MODEL_NOT_SPECIFIED, "model_not_specified", 400, "Model not specified in request"),
             (ErrorType.MISSING_REQUIRED_FIELD, "missing_required_field", 400, "Missing required field: {field_name}"),
+            (ErrorType.WRONG_API, "wrong_api", 400, "Model '{model_id}' is served over {expected_path}"),
             (ErrorType.MISSING_API_KEY, "missing_api_key", 401, "API key missing"),
             (ErrorType.INVALID_API_KEY, "invalid_api_key", 401, "Invalid API key"),
             (ErrorType.MODEL_NOT_ALLOWED, "model_not_allowed", 403, "Model '{model_id}' is not available for your account"),

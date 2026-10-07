@@ -59,7 +59,12 @@ FORWARDED_HEADER_DENYLIST = _CREDENTIAL_HEADERS | _TRANSPORT_HEADERS | _TOPOLOGY
 FORWARDED_HEADER_DENY_PREFIXES = _TOPOLOGY_PREFIXES
 
 # Static `headers:` from providers.yaml is operator-authored, so it is held to
-# a stricter standard than client input: the key comes from api_key_env (see
-# the INVARIANT over Provider), and per-request transport values are owned
-# by the router itself (Content-Type defaults / multipart boundary popping).
-FORBIDDEN_STATIC_HEADERS = frozenset({"authorization"}) | _TRANSPORT_HEADERS
+# a stricter standard than client input: the provider's own credential header is
+# built from api_key_env (see the INVARIANT over Provider — Authorization for
+# OpenAI-compat, x-api-key for Anthropic-protocol), so a static twin would
+# collide with it; and per-request transport values are owned by the router
+# itself (Content-Type defaults / multipart boundary popping).
+# WHY not all of _CREDENTIAL_HEADERS: api_key_env can only emit those two names,
+# so a static `api-key` / `cookie` is the ONLY way to reach a backend keyed on
+# another header (Azure OpenAI's `api-key`) — and nothing router-owned collides.
+FORBIDDEN_STATIC_HEADERS = frozenset({"authorization", "x-api-key"}) | _TRANSPORT_HEADERS

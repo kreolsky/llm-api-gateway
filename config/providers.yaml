@@ -10,6 +10,10 @@ providers:
     base_url: https://api.deepseek.com/v1
     api_key_env: DEEPSEEK_API_KEY
     reasoning_dialect: deepseek # native: thinking + reasoning_effort both stay on the wire
+  deepseek-anthropic:
+    type: anthropic # native Anthropic Messages protocol -> POST {base_url}/v1/messages
+    base_url: https://api.deepseek.com/anthropic
+    api_key_env: DEEPSEEK_API_KEY
   kimi:
     type: openai
     base_url: https://api.moonshot.ai/v1

@@ -5,8 +5,9 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from src.core.config_manager import Settings
-from src.core.config_schema import ConfigError, parse_config, parse_provider
-from src.providers import ProviderRegistry, _build_provider
+from src.core.config_schema import PROVIDER_TYPES, ConfigError, parse_config, parse_provider
+from src.providers import PROVIDER_CLASSES, ProviderRegistry, _build_provider
+from src.services.base import PROTOCOL_BY_PROVIDER_TYPE
 
 
 async def _prepare(registry: ProviderRegistry, config: dict, settings: Settings) -> None:
@@ -26,6 +27,14 @@ def _make_config():
 
 def _settings() -> Settings:
     return Settings()
+
+
+def test_every_provider_type_has_a_class_and_a_protocol():
+    """parse_provider accepts exactly PROVIDER_TYPES, so the factory and the
+    protocol gate must cover exactly that set — a type with no class is a
+    KeyError at build, a type with no protocol is a 400 on every request."""
+    assert set(PROVIDER_CLASSES) == set(PROVIDER_TYPES)
+    assert set(PROTOCOL_BY_PROVIDER_TYPE) == set(PROVIDER_TYPES)
 
 
 class TestBuildProviderName:

@@ -102,9 +102,12 @@ def parse_effort_policy(model_config: Any) -> tuple[dict[str, Any] | None, str |
 REASONING_DIALECTS = ("openai", "deepseek", "openrouter")
 DEFAULT_REASONING_DIALECT = "openai"
 
-# One provider type today; `type:` stays required and validated so a second
-# type can come back without a config change.
-PROVIDER_TYPES = ("openai",)
+# ARCH: one protocol per provider type — a model's protocol is its provider's
+# type (`openai` -> /v1/chat/completions, `anthropic` -> /v1/messages), so a
+# dual-protocol vendor gets two provider entries, one per protocol. The
+# factory mapping type -> class lives in providers/__init__.py and must cover
+# exactly this tuple.
+PROVIDER_TYPES = ("openai", "anthropic")
 
 
 def validate_reasoning_dialect(value: Any) -> None:
@@ -126,7 +129,7 @@ def _validate_static_headers(headers: Mapping[Any, Any]) -> None:
                 f"headers entries must be 'name: value' strings, got {name!r}: {value!r}.")
         if name.lower() in FORBIDDEN_STATIC_HEADERS:
             raise ConfigError(
-                f"headers may not set {name!r} (Authorization comes from api_key_env; "
+                f"headers may not set {name!r} (credential headers come from api_key_env; "
                 f"transport/hop-by-hop headers are owned by the router).")
 
 
@@ -277,6 +280,7 @@ def _parse_key(raw: Any) -> KeyEntry:
 _MODEL_INFO_KEYS = {
     "name", "description", "context_length", "max_completion_tokens",
     "is_moderated", "architecture", "supported_parameters", "reasoning", "pricing",
+    "compat",
 }
 _MODEL_INFO_ARCH_KEYS = {
     "input_modalities", "output_modalities", "tokenizer", "instruct_type",
@@ -320,6 +324,59 @@ def _parse_pricing(model_id: str, pricing: Any) -> dict[str, float] | None:
     return parsed
 
 
+def _parse_compat(model_id: str, compat: Any) -> dict[str, bool | int | str] | None:
+    """Normalize one model_info compat block: string keys -> scalar values.
+
+    ``compat`` carries pi-ai compatibility flags (/v1/models renders it as
+    stored for anthropic-type models). Manual-only and hand-authored, so it is
+    soft-validated like the other model_info keys: a non-mapping drops the
+    whole block; a non-string key or a non-scalar value (list/dict/None) drops
+    just that entry — each with a warning naming the model. Returns None for a
+    non-mapping so the caller drops the whole key.
+    """
+    if not isinstance(compat, dict):
+        logger.warning(
+            f"model_info entry '{model_id}' has a non-mapping compat, ignoring",
+            extra={"config": {"model_info_key": model_id}},
+        )
+        return None
+    parsed: dict[str, bool | int | str] = {}
+    for key, value in compat.items():
+        if not isinstance(key, str) or not isinstance(value, (bool, int, str)):
+            logger.warning(
+                f"model_info entry '{model_id}' compat key {key!r} has a non-scalar "
+                f"value {value!r} (expected bool/str/int), ignoring it",
+                extra={"config": {"model_info_key": model_id, "compat_key": key}},
+            )
+            continue
+        parsed[key] = value
+    return parsed
+
+
+def _normalize_model_info_entry(model_id: str, entry: dict[str, Any]) -> dict[str, Any]:
+    """Normalize one KEPT model_info entry: pricing to floats, compat to
+    scalars. Returns a COPY whenever anything changed — the raw dict belongs
+    to the caller and is never mutated.
+    """
+    if "pricing" in entry:
+        parsed = _parse_pricing(model_id, entry["pricing"])
+        entry = dict(entry)
+        if parsed is None:
+            entry.pop("pricing")
+        else:
+            entry["pricing"] = parsed
+    if "compat" in entry:
+        parsed_compat = _parse_compat(model_id, entry["compat"])
+        entry = dict(entry)
+        if parsed_compat:
+            entry["compat"] = parsed_compat
+        else:
+            # None (non-mapping, already warned) or {} (every value was
+            # dropped with its own warning) — either way nothing to render.
+            entry.pop("compat")
+    return entry
+
+
 def _parse_model_info(model_info: Any, models: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
     """Soft-validate model_info: warn on unknown keys and orphan entries.
 
@@ -359,15 +416,7 @@ def _parse_model_info(model_info: Any, models: Mapping[str, Any]) -> dict[str, d
                     f"model_info entry '{model_id}'.architecture has unknown keys: {sorted(arch_unknown)}",
                     extra={"config": {"model_info_key": model_id, "unknown_keys": sorted(arch_unknown)}},
                 )
-        if "pricing" in entry:
-            parsed = _parse_pricing(model_id, entry["pricing"])
-            # Copy, never mutate: the raw dict belongs to the caller.
-            entry = dict(entry)
-            if parsed is None:
-                entry.pop("pricing")
-            else:
-                entry["pricing"] = parsed
-            kept[model_id] = entry
+        kept[model_id] = _normalize_model_info_entry(model_id, entry)
     return kept
 
 

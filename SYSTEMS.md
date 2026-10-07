@@ -8,6 +8,7 @@ and read the entry file(s). Aliases are hand-maintained in
 
 | System | Description | Entry file(s) | Aliases |
 |--------|-------------|---------------|---------|
+| anthropic-provider | Anthropic Messages wire (x-api-key + anthropic-version) | `src/providers/anthropic.py:2` | anthropic, claude, messages, /v1/messages, антропик |
 | api-app | FastAPI app, lifespan, routes, eager provider validation | `src/api/main.py:2` | startup, lifespan, роуты, приложение |
 | auth | bearer authentication (constant-time key comparison) and per-key model access control | `src/core/auth.py:2` | ключи, доступ, авторизация, user_keys, api key |
 | config | YAML load, 5s hot reload, env-backed settings | `src/core/config_manager.py:2` | конфиг, yaml, hot reload, перезагрузка конфига |

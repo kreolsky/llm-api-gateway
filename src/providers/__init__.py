@@ -5,7 +5,17 @@ import asyncio
 from ..core.config_manager import Settings
 from ..core.config_schema import ProviderEntry, RouterConfig
 from ..core.error_handling import ErrorType, create_error
+from .anthropic import AnthropicProvider
 from .base import Provider
+
+# ARCH: the factory is a {type: class} dict — a provider speaks exactly one
+# protocol, and the dict's keys are exactly PROVIDER_TYPES (parse_provider
+# validated `type` against it; tests/unit/test_provider_registry.py pins the
+# two lists together).
+PROVIDER_CLASSES: dict[str, type[Provider]] = {
+    "openai": Provider,
+    "anthropic": AnthropicProvider,
+}
 
 
 def _build_provider(
@@ -15,9 +25,10 @@ def _build_provider(
 ) -> Provider:
     """Pure factory: return a new instance. No caching.
 
-    The entry's `type` was validated by parse_config, so there is one arm.
+    The entry's `type` was validated by parse_config, so the lookup always
+    resolves.
     """
-    return Provider(entry, settings, provider_name=provider_name)
+    return PROVIDER_CLASSES[entry.type](entry, settings, provider_name=provider_name)
 
 
 async def _gather_closes(coros) -> None:

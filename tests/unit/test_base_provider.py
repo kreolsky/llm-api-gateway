@@ -925,6 +925,24 @@ class TestStaticHeadersValidation:
                 ProviderStub(_entry(config), Settings())
         assert "headers" in str(exc_info.value)
 
+    @pytest.mark.parametrize("name", ["x-api-key", "X-Api-Key"])
+    def test_router_owned_credential_header_fails_fast(self, name):
+        """x-api-key is built from api_key_env by AnthropicProvider, so a
+        static twin would collide with it — refused at parse."""
+        config = {"base_url": "https://api.example.com", "api_key_env": "TEST_API_KEY",
+                  "headers": {name: "literal-key"}}
+        with patch.dict("os.environ", {"TEST_API_KEY": "sk-test-123"}, clear=False):
+            with pytest.raises(ConfigError) as exc_info:
+                ProviderStub(_entry(config), Settings())
+        assert "headers" in str(exc_info.value)
+
+    @pytest.mark.parametrize("name", ["api-key", "x-goog-api-key", "Cookie"])
+    def test_credential_header_api_key_env_cannot_emit_is_accepted(self, name):
+        """api_key_env emits only Authorization / x-api-key, so a static
+        `api-key` (Azure OpenAI) is the only way to reach such a backend."""
+        provider = _build_provider(headers={name: "literal-key"})
+        assert provider.headers[name] == "literal-key"
+
     @pytest.mark.parametrize("name", ["Content-Length", "host", "Transfer-Encoding",
                                       "Connection", "Accept-Encoding"])
     def test_hop_by_hop_in_headers_fails_fast(self, name):

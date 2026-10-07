@@ -16,6 +16,7 @@ class EmbeddingService(BaseService):
         prepared = await self._prepare_dispatch(
             request, auth_context,
             component="embedding_service", log_title="Embedding Request JSON",
+            api="openai-completions",
         )
 
         async with self._guard_service_errors(prepared.error_ctx):

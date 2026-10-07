@@ -54,6 +54,7 @@ _MIGRATIONS: dict[str, str] = {
     # only inside set_usage().
     "has_usage": "INTEGER NOT NULL DEFAULT 1",
     "stream": "INTEGER NOT NULL DEFAULT 0",
+    "cache_write_tokens": "INTEGER NOT NULL DEFAULT 0",
 }
 
 
@@ -78,6 +79,7 @@ class RequestStats:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     cached_tokens: int = 0
+    cache_write_tokens: int = 0
     reasoning_tokens: int = 0
     total_tokens: int = 0
     error_code: str | None = None
@@ -87,17 +89,37 @@ class RequestStats:
     def set_usage(self, usage: dict[str, Any]) -> None:
         """Single token-extraction point for the provider usage shape.
 
-        The only place that reads ``prompt_tokens_details.cached_tokens`` and
-        ``completion_tokens_details.reasoning_tokens``, so the stream and
-        non-stream field sets cannot drift.
+        The only place that reads ``prompt_tokens_details.cached_tokens`` /
+        ``cache_write_tokens`` and ``completion_tokens_details.reasoning_tokens``,
+        so the stream and non-stream field sets cannot drift.
         """
         prompt_details = usage.get("prompt_tokens_details") or {}
         completion_details = usage.get("completion_tokens_details") or {}
         self.prompt_tokens = int(usage.get("prompt_tokens") or 0)
         self.completion_tokens = int(usage.get("completion_tokens") or 0)
         self.cached_tokens = int(prompt_details.get("cached_tokens") or 0)
+        self.cache_write_tokens = int(prompt_details.get("cache_write_tokens") or 0)
         self.reasoning_tokens = int(completion_details.get("reasoning_tokens") or 0)
         self.total_tokens = int(usage.get("total_tokens") or 0)
+        self.has_usage = True
+
+    def set_anthropic_usage(self, usage: dict[str, Any]) -> None:
+        """Single token-extraction point for the Anthropic Messages usage shape.
+
+        Anthropic reports ``input_tokens`` WITHOUT the cache components
+        (matching Claude's prompt_tokens = input + cache_read + cache_creation
+        convention), so the router's prompt_tokens sums all three to stay
+        comparable with the OpenAI-wire rows; cached_tokens / cache_write_tokens
+        carry the split for the cost formula.
+        """
+        input_tokens = int(usage.get("input_tokens") or 0)
+        cache_read = int(usage.get("cache_read_input_tokens") or 0)
+        cache_write = int(usage.get("cache_creation_input_tokens") or 0)
+        self.prompt_tokens = input_tokens + cache_read + cache_write
+        self.cached_tokens = cache_read
+        self.cache_write_tokens = cache_write
+        self.completion_tokens = int(usage.get("output_tokens") or 0)
+        self.total_tokens = self.prompt_tokens + self.completion_tokens
         self.has_usage = True
 
 
@@ -160,6 +182,7 @@ async def _apply_schema(conn: aiosqlite.Connection) -> None:
             prompt_tokens INTEGER NOT NULL DEFAULT 0,
             completion_tokens INTEGER NOT NULL DEFAULT 0,
             cached_tokens INTEGER NOT NULL DEFAULT 0,
+            cache_write_tokens INTEGER NOT NULL DEFAULT 0,
             total_tokens INTEGER NOT NULL DEFAULT 0,
             duration_ms REAL,
             status_code INTEGER,
@@ -205,11 +228,13 @@ async def close_db() -> None:
 def _compute_cost_usd(stats: RequestStats, pricing_lookup: PricingLookup | None) -> float | None:
     """Write-time cost from merged capabilities pricing; None when unpriced.
 
-    (prompt - cached) * prompt + cached * input_cache_read + completion * completion.
-    A missing input_cache_read falls back to the prompt rate — stored pricing
-    only contains the keys the upstream actually sent, and treating an absent
-    cache rate as free would systematically under-report cost. A price that
-    is not a number also returns None: an unpriced row, never a lost one.
+    (prompt - cached - cache_write) * prompt + cached * input_cache_read +
+    cache_write * input_cache_write + completion * completion.
+    A missing input_cache_read/input_cache_write falls back to the prompt
+    rate — stored pricing only contains the keys the upstream actually sent,
+    and treating an absent cache rate as free would systematically
+    under-report cost. A price that is not a number also returns None: an
+    unpriced row, never a lost one.
     """
     if stats.prompt_tokens + stats.completion_tokens <= 0:
         return None
@@ -226,18 +251,20 @@ def _compute_cost_usd(stats: RequestStats, pricing_lookup: PricingLookup | None)
     completion_price = pricing.get("completion")
     if prompt_price is None or completion_price is None:
         return None
-    cache_price = pricing.get("input_cache_read", prompt_price)
+    cache_read_price = pricing.get("input_cache_read", prompt_price)
+    cache_write_price = pricing.get("input_cache_write", prompt_price)
     # WHY: a price that is not a number degrades to an unpriced row, never a
     # lost one — int*str is string repetition, a float+str sum raises
     # TypeError, and _flush_row calls this OUTSIDE its try, so the whole
     # usage row would vanish. bool is excluded explicitly: it is an int
     # subclass, so True would price as a real 1.0.
     if any(isinstance(p, bool) or not isinstance(p, (int, float))
-           for p in (prompt_price, completion_price, cache_price)):
+           for p in (prompt_price, completion_price, cache_read_price, cache_write_price)):
         return None
-    non_cached = max(stats.prompt_tokens - stats.cached_tokens, 0)
+    non_cached = max(stats.prompt_tokens - stats.cached_tokens - stats.cache_write_tokens, 0)
     return (non_cached * prompt_price
-            + stats.cached_tokens * cache_price
+            + stats.cached_tokens * cache_read_price
+            + stats.cache_write_tokens * cache_write_price
             + stats.completion_tokens * completion_price)
 
 
@@ -265,10 +292,10 @@ async def _flush_row(
             """INSERT INTO usage_events
                (request_id, project_name, model_id, provider_name, endpoint,
                 timestamp, prompt_tokens, completion_tokens, cached_tokens,
-                reasoning_tokens, total_tokens, duration_ms, status_code,
-                error_code, error_message, api_key_hash, client_ip,
+                cache_write_tokens, reasoning_tokens, total_tokens, duration_ms,
+                status_code, error_code, error_message, api_key_hash, client_ip,
                 cost_usd, has_usage, stream)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 request_id,
                 project_name or "unknown",
@@ -279,6 +306,7 @@ async def _flush_row(
                 stats.prompt_tokens,
                 stats.completion_tokens,
                 stats.cached_tokens,
+                stats.cache_write_tokens,
                 stats.reasoning_tokens,
                 stats.total_tokens,
                 duration_ms,

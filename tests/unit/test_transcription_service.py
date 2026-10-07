@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi import HTTPException
 
-from src.core.config_schema import parse_config
+from src.core.config_schema import parse_config, parse_provider
 from src.core.context import AuthContext, RequestContext
 from src.core.logging import logger
 from src.core.usage_db import RequestStats
@@ -57,7 +57,8 @@ class TestSharedFunnel:
         providers = {"stt": {"type": "openai", "base_url": "https://api.example.com"}}
         service = TranscriptionService(_make_config_manager(models, providers), MagicMock(spec=ProviderRegistry))
 
-        provider_instance = SimpleNamespace(identity="passthrough")
+        provider_instance = SimpleNamespace(identity="passthrough",
+                                      entry=parse_provider({"type": "openai", "base_url": "https://x"}))
         provider_instance.transcriptions = AsyncMock(return_value={"text": "ok"})
 
         with patch.object(service.registry, "get", return_value=provider_instance), \
@@ -95,7 +96,8 @@ class TestSharedFunnel:
         providers = {"stt": {"type": "openai", "base_url": "https://api.example.com"}}
         service = TranscriptionService(_make_config_manager(models, providers), MagicMock(spec=ProviderRegistry))
 
-        provider_instance = SimpleNamespace(identity=None)
+        provider_instance = SimpleNamespace(identity=None,
+                                  entry=parse_provider({"type": "openai", "base_url": "https://x"}))
         provider_instance.transcriptions = AsyncMock(return_value={"text": "ok"})
         with patch.object(service.registry, "get", return_value=provider_instance):
             await service.create_transcription(
@@ -122,7 +124,8 @@ class TestIdentityHeadersForwarded:
         request = _make_request()
         request.headers = {"user-agent": "Kilo-Code/7.5.5", "authorization": "Bearer nnp-v1-x"}
 
-        provider_instance = SimpleNamespace(identity="passthrough")
+        provider_instance = SimpleNamespace(identity="passthrough",
+                                      entry=parse_provider({"type": "openai", "base_url": "https://x"}))
         provider_instance.transcriptions = AsyncMock(return_value={"text": "ok"})
         with patch.object(service.registry, "get", return_value=provider_instance):
             response = await service.create_transcription(

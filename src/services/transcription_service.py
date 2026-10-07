@@ -89,7 +89,8 @@ class TranscriptionService(BaseService):
             # ARCH: multipart cannot enter the JSON wrapper, so transcription
             # rides the body-agnostic resolver — the same funnel
             # _prepare_dispatch delegates to after parsing its JSON body.
-            target = await self._resolve_target(request, auth_context, model_id)
+            target = await self._resolve_target(request, auth_context, model_id,
+                                                api="openai-completions")
             response = await target.provider.transcriptions(
                 _provider_request_body(uploaded_file, audio_data, params),
                 target.provider_model_name, target.model_config,

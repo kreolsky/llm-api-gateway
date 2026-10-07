@@ -24,6 +24,24 @@ from .reasoning_effort import apply_reasoning_effort
 
 
 @dataclass(frozen=True)
+class Protocol:
+    """The wire protocol a provider type speaks: the api name services pass to
+    the dispatch funnel and the client-facing path that protocol is served
+    over (named in WRONG_API so a client learns where to resend)."""
+    api: str
+    path: str
+
+
+# ARCH: one protocol per provider type — a model's protocol is its provider's
+# type, so the /v1/messages <-> /v1/chat/completions routing question has one
+# answer per model and every endpoint enforces it through the same funnel.
+PROTOCOL_BY_PROVIDER_TYPE: dict[str, Protocol] = {
+    "openai": Protocol(api="openai-completions", path="/v1/chat/completions"),
+    "anthropic": Protocol(api="anthropic-messages", path="/v1/messages"),
+}
+
+
+@dataclass(frozen=True)
 class ResolvedTarget:
     """Result of the body-agnostic dispatch resolver (BaseService._resolve_target).
 
@@ -161,9 +179,12 @@ class BaseService:
         request: Request,
         auth_context: AuthContext,
         model_id: Any,
+        *,
+        api: str,
     ) -> ResolvedTarget:
         """Body-agnostic dispatch funnel: enrich stats, validate access,
-        resolve the provider, and build the identity headers.
+        resolve the provider, enforce the protocol gate, and build the
+        identity headers.
 
         A non-string model id (client sent JSON garbage) reaches the usage row
         as "" but keeps its raw value in error_ctx — the error messages quote
@@ -186,19 +207,47 @@ class BaseService:
 
         if not model_id:
             raise create_error(ErrorType.MODEL_NOT_SPECIFIED, **error_ctx)
-        model_config = self.resolve_model(model_id, auth_context, **error_ctx)
-        provider_name = model_config.provider
-        stats.provider_name = provider_name
+        model_config, provider_instance = self._resolve_provider(
+            model_id, auth_context, api, error_ctx)
+        stats.provider_name = model_config.provider
 
-        provider_instance = self.registry.get(provider_name)
         identity_headers = self._build_identity_headers(provider_instance, request)
 
         return ResolvedTarget(
             request_id=request_id, user_id=user_id, stats=stats, error_ctx=error_ctx,
-            model_config=model_config, provider_name=provider_name,
+            model_config=model_config, provider_name=model_config.provider,
             provider_model_name=model_config.provider_model_name or model_id,
             provider=provider_instance, identity_headers=identity_headers,
         )
+
+    def _resolve_provider(
+        self,
+        model_id: str,
+        auth_context: AuthContext,
+        api: str,
+        error_ctx: dict[str, Any],
+    ) -> tuple[ModelEntry, Provider]:
+        """resolve_model + registry lookup + the protocol gate.
+
+        ``api`` is the calling endpoint's protocol ("openai-completions" from
+        chat/embeddings/transcription, "anthropic-messages" from /v1/messages);
+        AFTER resolve_model (access before existence stays intact) the
+        provider instance's type is checked against it, so a model is only
+        ever dispatched over the protocol its provider speaks — by
+        construction, for every endpoint.
+        """
+        model_config = self.resolve_model(model_id, auth_context, **error_ctx)
+        provider_instance = self.registry.get(model_config.provider)
+        # INVARIANT: the protocol is read from the provider INSTANCE's own
+        # entry, never from the config dict.
+        # Why: the config and the registry are swapped separately on a reload,
+        # so a config-side entry can belong to a different generation than the
+        # backend actually called; the instance's entry is the one it was built
+        # from (same rule as the reasoning dialect in _prepare_dispatch).
+        protocol = PROTOCOL_BY_PROVIDER_TYPE[provider_instance.entry.type]
+        if protocol.api != api:
+            raise create_error(ErrorType.WRONG_API, expected_path=protocol.path, **error_ctx)
+        return model_config, provider_instance
 
     async def _prepare_dispatch(
         self,
@@ -207,13 +256,15 @@ class BaseService:
         *,
         component: str,
         log_title: str,
+        api: str,
     ) -> PreparedDispatch:
         """Thin JSON wrapper over _resolve_target: parse the body, log it,
         delegate, then apply the reasoning-effort policy to the parsed body.
 
         The effort policy is deliberately HERE and not in the resolver: it is
         body-shaped (reads/writes the JSON body), and multipart endpoints
-        riding the resolver must never get it.
+        riding the resolver must never get it. ``api`` is passed through to
+        the resolver's protocol gate unchanged.
         """
         request_body = await self._parse_json_request(request)
         requested_model = request_body.get("model")
@@ -222,7 +273,7 @@ class BaseService:
                           request_id=request_context(request).request_id,
                           component=component, data_flow="incoming")
 
-        target = await self._resolve_target(request, auth_context, requested_model)
+        target = await self._resolve_target(request, auth_context, requested_model, api=api)
 
         # ARCH: the effort policy rides the one dispatch funnel (services/reasoning_effort.py).
         request_body = apply_reasoning_effort(request_body, target.model_config.effort_policy,

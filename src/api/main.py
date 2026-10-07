@@ -14,7 +14,11 @@ from ..core.auth import check_endpoint_access
 from ..core.config_manager import ConfigManager
 from ..core.config_schema import RouterConfig
 from ..core.context import AuthContext, request_context
-from ..core.error_handling import enrich_stats_from_envelope
+from ..core.error_handling import (
+    anthropic_error_from_envelope,
+    anthropic_error_payload,
+    enrich_stats_from_envelope,
+)
 from ..core.logging import logger
 from ..core.model_capabilities import CapabilitiesCache
 from ..core.usage_db import close_db, drain_pending_flushes, init_db, request_stats
@@ -22,6 +26,7 @@ from ..providers import ProviderRegistry
 from ..services.capabilities_refresh import capabilities_refresh_loop
 from ..services.chat_service.chat_service import ChatService
 from ..services.embedding_service import EmbeddingService
+from ..services.messages_service import MessagesService
 from ..services.model_service import ModelService
 from ..services.transcription_service import TranscriptionService
 from .middleware import RequestLoggerMiddleware
@@ -92,6 +97,7 @@ async def lifespan(app: FastAPI):
     app.state.chat_service = ChatService(config_manager, registry)
     app.state.embedding_service = EmbeddingService(config_manager, registry)
     app.state.transcription_service = TranscriptionService(config_manager, registry)
+    app.state.messages_service = MessagesService(config_manager, registry)
 
     await init_db(config_manager.settings.usage_db_path, app.state.model_service.get_pricing)
 
@@ -131,18 +137,40 @@ async def custom_http_exception_handler(request: Request, exc: StarletteHTTPExce
     (unmatched-route 404s) writes only error_message and leaves error_code
     NULL — an error status with NULL error_code is an expected shape, the UI
     groups it under "—".
+
+    ARCH: on /v1/messages the RENDERED body is Anthropic-shaped
+    ({"type":"error","error":{"type","message"}}) — a native Messages client
+    cannot parse the OpenRouter envelope. The conversion runs AFTER the
+    stats enrichment read the envelope, so the usage row keeps the
+    router-side error_code either way.
     """
     stats = request_stats(request)
     content = exc.detail
     if isinstance(content, dict) and "error" in content:
         enrich_stats_from_envelope(stats, content)
+        if _is_messages_route(request):
+            return JSONResponse(
+                status_code=exc.status_code,
+                content=anthropic_error_from_envelope(exc.status_code, content),
+            )
         return JSONResponse(status_code=exc.status_code, content=content)
     if content is not None:
         stats.error_message = str(content)
+    if _is_messages_route(request):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content=anthropic_error_payload(exc.status_code, str(content or "Request failed")),
+        )
     return JSONResponse(
         status_code=exc.status_code,
         content={"error": {"code": exc.status_code, "message": str(content)}}
     )
+
+
+def _is_messages_route(request: Request) -> bool:
+    """The Anthropic-shape boundary: router-made errors on POST /v1/messages
+    are rendered for a native Messages client (Lore's pi-ai harness)."""
+    return request.url.path == "/v1/messages"
 
 app.add_middleware(RequestLoggerMiddleware)
 
@@ -163,6 +191,11 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
         f"Unhandled exception: {type(exc).__name__}: {exc}",
         request_id=request_context(request).request_id,
     )
+    if _is_messages_route(request):
+        return JSONResponse(
+            status_code=500,
+            content=anthropic_error_payload(500, "Internal server error"),
+        )
     return JSONResponse(
         status_code=500,
         content={"error": {"code": 500,
@@ -210,6 +243,17 @@ async def chat_completions(
     auth_context: AuthContext = Depends(check_endpoint_access("/v1/chat/completions"))
 ):
     return await app.state.chat_service.chat_completions(request, auth_context)
+
+# ARCH: the Anthropic Messages pass-through — native Messages bodies to
+# anthropic-type providers (the protocol gate in _resolve_target refuses an
+# openai-type model here with 400 wrong_api). Errors on this route render
+# Anthropic-shaped (see custom_http_exception_handler).
+@app.post("/v1/messages", name="messages")
+async def messages(
+    request: Request,
+    auth_context: AuthContext = Depends(check_endpoint_access("/v1/messages"))
+):
+    return await app.state.messages_service.messages(request, auth_context)
 
 @app.post("/v1/embeddings", name="embeddings")
 async def create_embeddings(

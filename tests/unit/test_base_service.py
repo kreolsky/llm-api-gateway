@@ -126,7 +126,7 @@ class TestResolveModel:
         svc = _build_service()
         auth_ctx = _make_auth_context()
         with pytest.raises(HTTPException) as exc_info:
-            await svc._resolve_target(_make_identity_request(), auth_ctx, "")
+            await svc._resolve_target(_make_identity_request(), auth_ctx, "", api="openai-completions")
         assert exc_info.value.status_code == 400
 
     @pytest.mark.asyncio
@@ -135,7 +135,7 @@ class TestResolveModel:
         svc = _build_service()
         auth_ctx = _make_auth_context()
         with pytest.raises(HTTPException) as exc_info:
-            await svc._resolve_target(_make_identity_request(), auth_ctx, None)
+            await svc._resolve_target(_make_identity_request(), auth_ctx, None, api="openai-completions")
         assert exc_info.value.status_code == 400
 
     def test_model_not_in_allowed_raises_403(self):
@@ -190,14 +190,15 @@ class TestResolveModel:
         assert model_config.provider_model_name == "gpt-4-turbo"
 
     @pytest.mark.asyncio
-    async def test_dispatch_defaults_provider_model_name(self):
+    async def test_dispatch_defaults_provider_model_name(self, registry, mock_get):
         """When provider_model_name is absent, the dispatch funnel sends the requested model name."""
+        mock_get.return_value = _provider()
         models = {"gpt-4": {"provider": "openai"}}
         providers = {"openai": {"type": "openai"}}
-        svc = _build_service(models=models, providers=providers)
+        svc = _build_service(models=models, providers=providers, registry=registry)
         auth_ctx = _make_auth_context()
 
-        target = await svc._resolve_target(_make_identity_request(), auth_ctx, "gpt-4")
+        target = await svc._resolve_target(_make_identity_request(), auth_ctx, "gpt-4", api="openai-completions")
         assert target.provider_model_name == "gpt-4"
 
     def test_empty_allowed_models_unrestricted(self):
@@ -265,7 +266,7 @@ class TestPrepareDispatchProviders:
         request.json = AsyncMock(return_value={"model": "gpt-4"})
 
         prepared = await svc._prepare_dispatch(
-            request, auth_ctx, component="chat_service", log_title="Request JSON"
+            request, auth_ctx, component="chat_service", log_title="Request JSON", api="openai-completions"
         )
 
         assert prepared.provider is mock_provider
@@ -288,7 +289,7 @@ class TestPrepareDispatchProviders:
 
         with pytest.raises(HTTPException) as exc_info:
             await svc._prepare_dispatch(
-                request, auth_ctx, component="chat_service", log_title="Request JSON"
+                request, auth_ctx, component="chat_service", log_title="Request JSON", api="openai-completions"
             )
         assert exc_info.value.status_code == 404
 
@@ -319,7 +320,7 @@ class TestPrepareDispatchPreamble:
         with pytest.raises(HTTPException) as exc_info:
             await svc._prepare_dispatch(
                 request, _make_auth_context(),
-                component="c", log_title="t",
+                component="c", log_title="t", api="openai-completions",
             )
         assert exc_info.value.status_code == 400
 
@@ -331,7 +332,7 @@ class TestPrepareDispatchPreamble:
         request.headers = {"user-agent": "oc/1.0"}
 
         prepared = await svc._prepare_dispatch(
-            request, _make_auth_context(), component="c", log_title="t"
+            request, _make_auth_context(), component="c", log_title="t", api="openai-completions"
         )
 
         assert prepared.requested_model == "m"
@@ -358,7 +359,7 @@ class TestPrepareDispatchPreamble:
 
         with pytest.raises(HTTPException) as exc_info:
             await svc._prepare_dispatch(
-                request, _make_auth_context(), component="c", log_title="t"
+                request, _make_auth_context(), component="c", log_title="t", api="openai-completions"
             )
         assert exc_info.value.status_code == 404
         assert stats.model_id == ""
@@ -391,7 +392,7 @@ class TestPrepareDispatchDialectTranslation:
                                  "reasoning_effort": "high"})
 
         prepared = await svc._prepare_dispatch(
-            request, _make_auth_context(), component="c", log_title="t")
+            request, _make_auth_context(), component="c", log_title="t", api="openai-completions")
 
         assert prepared.request_body["reasoning"] == {"effort": "high"}
         assert "thinking" not in prepared.request_body
@@ -406,7 +407,7 @@ class TestPrepareDispatchDialectTranslation:
                                  "reasoning_effort": "low"})
 
         prepared = await svc._prepare_dispatch(
-            request, _make_auth_context(), component="c", log_title="t")
+            request, _make_auth_context(), component="c", log_title="t", api="openai-completions")
 
         assert prepared.request_body["reasoning_effort"] == "low"
         assert "thinking" not in prepared.request_body
@@ -422,7 +423,7 @@ class TestPrepareDispatchDialectTranslation:
         request = self._request(dict(body))
 
         prepared = await svc._prepare_dispatch(
-            request, _make_auth_context(), component="c", log_title="t")
+            request, _make_auth_context(), component="c", log_title="t", api="openai-completions")
 
         assert prepared.request_body == body
 
@@ -435,7 +436,7 @@ class TestPrepareDispatchDialectTranslation:
         request = self._request({"model": "m", "messages": [], "reasoning_effort": "high"})
 
         prepared = await svc._prepare_dispatch(
-            request, _make_auth_context(), component="c", log_title="t")
+            request, _make_auth_context(), component="c", log_title="t", api="openai-completions")
 
         assert prepared.request_body["reasoning"] == {"effort": "high"}
         assert "reasoning_effort" not in prepared.request_body
@@ -458,7 +459,7 @@ class TestPrepareDispatchDialectTranslation:
 
         with pytest.raises(HTTPException) as exc_info:
             await svc._prepare_dispatch(
-                request, _make_auth_context(), component="c", log_title="t")
+                request, _make_auth_context(), component="c", log_title="t", api="openai-completions")
         assert exc_info.value.status_code == 400
 
 
@@ -488,7 +489,7 @@ class TestResolveTarget:
         svc = self._svc(registry)
         request = _make_identity_request({"user-agent": "oc/1.0"})
 
-        target = await svc._resolve_target(request, _make_auth_context(), "m")
+        target = await svc._resolve_target(request, _make_auth_context(), "m", api="openai-completions")
 
         assert target.provider is mock_get.return_value
         assert target.provider_name == "openai"
@@ -510,7 +511,7 @@ class TestResolveTarget:
 
         with pytest.raises(HTTPException) as exc_info:
             await svc._resolve_target(
-                request, _make_auth_context(allowed_models=["other"]), "m"
+                request, _make_auth_context(allowed_models=["other"]), "m", api="openai-completions"
             )
         assert exc_info.value.status_code == 403
         mock_get.assert_not_called()
@@ -533,7 +534,7 @@ class TestResolveTarget:
                 provider=mock_get.return_value, identity_headers=None,
             )
             prepared = await svc._prepare_dispatch(
-                request, _make_auth_context(), component="c", log_title="t"
+                request, _make_auth_context(), component="c", log_title="t", api="openai-completions"
             )
 
         mock_resolve.assert_awaited_once()
@@ -557,10 +558,84 @@ class TestResolveTarget:
         request.headers = {}
 
         prepared = await svc._prepare_dispatch(
-            request, _make_auth_context(), component="c", log_title="t"
+            request, _make_auth_context(), component="c", log_title="t", api="openai-completions"
         )
 
         assert prepared.request_body["reasoning_effort"] == "high"
+
+
+# ===================================================================
+# Protocol gate — one api per provider type
+# ===================================================================
+
+class TestProtocolGate:
+    """_resolve_target enforces the calling endpoint's api against the
+    provider instance's type, AFTER resolve_model — access before existence
+    before protocol."""
+
+    ENDPOINT_APIS = ("openai-completions", "anthropic-messages")
+
+    def _service(self, registry, provider_type):
+        return _build_service(
+            models={"m": {"provider": "p"}},
+            providers={"p": {"type": provider_type, "base_url": "https://x.example.com"}},
+            registry=registry,
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("provider_type", ["openai", "anthropic"])
+    @pytest.mark.parametrize("api", ENDPOINT_APIS)
+    async def test_every_api_provider_pair(self, registry, mock_get, provider_type, api):
+        """Match passes, mismatch is a 400 wrong_api naming the served path."""
+        mock_get.return_value = _provider_of_type(provider_type)
+        svc = self._service(registry, provider_type)
+
+        expected = {"openai": "/v1/chat/completions", "anthropic": "/v1/messages"}[provider_type]
+        if provider_type == "openai" and api == "openai-completions" or \
+           provider_type == "anthropic" and api == "anthropic-messages":
+            target = await svc._resolve_target(
+                _make_identity_request(), _make_auth_context(), "m", api=api)
+            assert target.provider is mock_get.return_value
+        else:
+            with pytest.raises(HTTPException) as exc_info:
+                await svc._resolve_target(
+                    _make_identity_request(), _make_auth_context(), "m", api=api)
+            assert exc_info.value.status_code == 400
+            assert exc_info.value.detail["error"]["metadata"]["error_code"] == "wrong_api"
+            assert expected in exc_info.value.detail["error"]["message"]
+            assert "'m'" in exc_info.value.detail["error"]["message"]
+
+    @pytest.mark.asyncio
+    async def test_access_denied_beats_protocol_mismatch(self, registry, mock_get):
+        """A key without access to the model gets 403 even on a mismatch —
+        the INVARIANT (access before existence) extends to the protocol gate."""
+        mock_get.return_value = _provider_of_type("anthropic")
+        svc = self._service(registry, "anthropic")
+
+        with pytest.raises(HTTPException) as exc_info:
+            await svc._resolve_target(
+                _make_identity_request(), _make_auth_context(allowed_models=["other"]),
+                "m", api="openai-completions",
+            )
+        assert exc_info.value.status_code == 403
+        mock_get.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_nonexistent_model_is_404_not_wrong_api(self, registry, mock_get):
+        """Existence before protocol: an unknown model answers 404 from
+        resolve_model, before the registry lookup the gate reads."""
+        svc = _build_service(models={}, providers={}, registry=registry)
+        with pytest.raises(HTTPException) as exc_info:
+            await svc._resolve_target(
+                _make_identity_request(), _make_auth_context(), "ghost", api="anthropic-messages")
+        assert exc_info.value.status_code == 404
+        mock_get.assert_not_called()
+
+
+def _provider_of_type(provider_type):
+    """A stand-in provider instance of the given protocol (entry carries type)."""
+    return SimpleNamespace(identity=None, entry=parse_provider(
+        {"type": provider_type, "base_url": "https://x.example.com"}))
 
 
 # ===================================================================

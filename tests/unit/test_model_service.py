@@ -677,6 +677,80 @@ class TestCapabilities:
 
 
 # ===================================================================
+# api field + compat — the Lore-facing protocol contract
+# ===================================================================
+
+_ANTHROPIC_PROVIDERS = {
+    "prov-a": {"type": "openai", "base_url": "https://a.example.com"},
+    "prov-an": {"type": "anthropic", "base_url": "https://an.example.com"},
+}
+
+
+class TestApiField:
+    """Every listed model carries `api` derived from its provider's type —
+    that is how /v1/models tells Lore (pi-ai) which protocol to use."""
+
+    @pytest.mark.asyncio
+    async def test_api_derived_from_provider_type_in_list(self):
+        models = {
+            "open/model": {"provider": "prov-a"},
+            "anthropic/model": {"provider": "prov-an"},
+        }
+        svc = _build_service(models=models, providers=_ANTHROPIC_PROVIDERS)
+
+        listed = await svc.list_models(_make_auth_context(allowed_models=[]))
+        by_id = {m["id"]: m for m in listed["data"]}
+        assert by_id["open/model"]["api"] == "openai-completions"
+        assert by_id["anthropic/model"]["api"] == "anthropic-messages"
+
+    @pytest.mark.asyncio
+    async def test_api_in_detail_matches_list(self):
+        models = {"anthropic/model": {"provider": "prov-an"}}
+        svc = _build_service(models=models, providers=_ANTHROPIC_PROVIDERS)
+
+        listed = await svc.list_models(_make_auth_context(allowed_models=[]))
+        detail = await svc.retrieve_model("anthropic/model", _make_auth_context(allowed_models=[]))
+
+        assert detail["api"] == "anthropic-messages"
+        assert detail["api"] == next(m for m in listed["data"]
+                                     if m["id"] == "anthropic/model")["api"]
+
+    @pytest.mark.asyncio
+    async def test_compat_rendered_as_stored(self):
+        """model_info compat (manual-only) renders verbatim on /v1/models."""
+        compat = {"forceAdaptiveThinking": True, "supportsMidConvoEffort": True,
+                  "title": "deep thinker"}
+        models = {"anthropic/model": {"provider": "prov-an"}}
+        model_info = {"anthropic/model": {"compat": compat}}
+        svc = _build_service(models=models, providers=_ANTHROPIC_PROVIDERS,
+                             model_info=model_info)
+
+        detail = await svc.retrieve_model("anthropic/model", _make_auth_context(allowed_models=[]))
+        assert detail["compat"] == compat
+
+    @pytest.mark.asyncio
+    async def test_anthropic_model_with_effort_policy_in_capabilities(self):
+        """Lore reads effort levels from /v1/capabilities: an anthropic-type
+        model with a reasoning_effort block (advertisement only on that wire)
+        appears by construction, and a key without access does not see it."""
+        models = {
+            "anthropic/model": {"provider": "prov-an",
+                                "reasoning_effort": {"allowed": ["low", "high", "max"],
+                                                     "param": "reasoning_effort"}},
+            "plain": {"provider": "prov-a"},
+        }
+        svc = _build_service(models=models, providers=_ANTHROPIC_PROVIDERS)
+
+        caps = await svc.capabilities(_make_auth_context(allowed_models=[]))
+        assert caps["anthropic/model"] == {"supported": True,
+                                           "effort_levels": ["low", "high", "max"]}
+
+        restricted = await svc.capabilities(
+            _make_auth_context(allowed_models=["plain"]))
+        assert "anthropic/model" not in restricted
+
+
+# ===================================================================
 # get_pricing
 # ===================================================================
 

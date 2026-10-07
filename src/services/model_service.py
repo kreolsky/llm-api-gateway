@@ -20,7 +20,7 @@ from ..core.model_capabilities import (
     render_capabilities,
 )
 from ..providers import ProviderRegistry
-from .base import BaseService
+from .base import PROTOCOL_BY_PROVIDER_TYPE, BaseService
 from .capabilities_refresh import refresh_provider_capabilities
 
 
@@ -134,6 +134,22 @@ class ModelService(BaseService):
         pricing = self._resolve_stored_capabilities(model_id).get("pricing")
         return pricing if isinstance(pricing, dict) and pricing else None
 
+    def _model_api(self, model_id: str) -> str | None:
+        """The protocol this model is served over — its provider's type.
+
+        One derivation for list_models and retrieve_model, so /v1/models and
+        /v1/models/{id} cannot disagree about where to send a client. None
+        when the provider entry is missing or of an unknown type (a dangling
+        reference already warned at load; retrieval 404s before rendering).
+        """
+        config = self.config_manager.get_config()
+        model_entry = config.models.get(model_id)
+        if model_entry is None or model_entry.provider not in config.providers:
+            return None
+        provider_type = config.providers[model_entry.provider].type
+        protocol = PROTOCOL_BY_PROVIDER_TYPE.get(provider_type)
+        return protocol.api if protocol else None
+
     def _capability_meta(self, model_id: str) -> dict[str, Any]:
         """Provenance fields (source, fetched_at) for diagnostics, when available."""
         meta = self.capabilities_cache.get_meta(model_id)
@@ -170,6 +186,9 @@ class ModelService(BaseService):
         for model_id, _model_data in self._iter_visible_models(auth_context.allowed_models):
             stored = self._resolve_stored_capabilities(model_id)
             rendered = render_capabilities(stored)
+            api = self._model_api(model_id)
+            if api is not None:
+                rendered["api"] = api
             models_list.append(self._build_model_response(model_id, **rendered))
         return {"object": "list", "data": models_list}
 
@@ -211,6 +230,9 @@ class ModelService(BaseService):
         stored = self._resolve_stored_capabilities(model_id)
         rendered = render_capabilities(stored)
         meta = self._capability_meta(model_id)
+        api = self._model_api(model_id)
+        if api is not None:
+            rendered["api"] = api
 
         return self._build_model_response(
             model_id,

@@ -22,17 +22,23 @@ async def get_api_key(
 ) -> AuthContext:
     """Authenticate the request and return the typed AuthContext.
 
-    Uses HTTPBearer scheme to extract token from Authorization header.
-    Uses constant-time comparison to prevent timing attacks.
-    Attaches project_name to the typed RequestContext on
-    request.state.request_context (via with_project_name(...)) for downstream
-    handlers — RequestContext is the single owner of the resolved project
-    name; AuthContext carries grants alone.
+    The client key is read from the Authorization Bearer header, falling back
+    to ``x-api-key`` when no Bearer is present (the Anthropic SDK inside pi-ai
+    sends its key there); Bearer wins when both are sent. Uses constant-time
+    comparison to prevent timing attacks. Attaches project_name to the typed
+    RequestContext on request.state.request_context (via with_project_name(...))
+    for downstream handlers — RequestContext is the single owner of the resolved
+    project name; AuthContext carries grants alone.
     """
     config_manager = request.app.state.config_manager
     config = config_manager.get_config()
 
     api_key = credentials.credentials if credentials else None
+    # WHY: Bearer present means the client chose the Bearer scheme — a junk
+    # x-api-key next to it must not authenticate, and a junk Bearer must not
+    # fall back to a valid x-api-key (the failure names the scheme was used).
+    if not api_key:
+        api_key = request.headers.get("x-api-key")
 
     logger.debug("Authentication attempt", extra={
         "auth": {

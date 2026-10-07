@@ -1,6 +1,7 @@
 {
   "api-app": ["startup", "lifespan", "роуты", "приложение"],
   "auth": ["ключи", "доступ", "авторизация", "user_keys", "api key"],
+  "anthropic-provider": ["anthropic", "claude", "messages", "/v1/messages", "антропик"],
   "config": ["конфиг", "yaml", "hot reload", "перезагрузка конфига"],
   "error-format": ["ошибки", "error"],
   "identity-headers": ["заголовки", "passthrough", "харнесс", "harness"],

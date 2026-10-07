@@ -37,30 +37,11 @@ def _is_rate_limit_error(e: BaseException) -> bool:
 
 
 
-def _auth_headers(entry: ProviderEntry, api_key: str | None, provider_name: str) -> dict[str, str]:
-    """Static headers for one provider: entry.headers + Content-Type default + Authorization.
-
-    Static checks on entry.headers already ran in parse_provider; only the
-    env-dependent one (the api_key_env variable is set) runs here.
-
-    Raises:
-        HTTPException: If api_key_env names an unset environment variable.
-    """
-    headers = dict(entry.headers or {})
-    headers.setdefault("Content-Type", "application/json")
-    # Only set the Authorization header if api_key_env is provided
-    if entry.api_key_env:
-        if not api_key:
-            raise create_error(ErrorType.PROVIDER_CONFIG_ERROR,
-                             error_details=f"API key for {entry.api_key_env} is not set in environment variables.",
-                             provider_name=provider_name)
-        headers["Authorization"] = f"Bearer {api_key}"
-    return headers
-
-
-# INVARIANT: self.headers["Authorization"] is set once in __init__ from
-# os.environ[api_key_env]. It is never replaced per-request. Client API keys
-# stay in auth.py and are not propagated to providers.
+# INVARIANT: the provider's credential headers are set once in __init__ from
+# os.environ[api_key_env] — Authorization for the OpenAI wire (this class),
+# x-api-key for the Anthropic wire (AnthropicProvider). They are never
+# replaced per-request. Client API keys stay in auth.py and are not
+# propagated to providers.
 class Provider:
     def __init__(self, entry: ProviderEntry, settings: Settings, provider_name: str):
         """Initialize provider from its parsed providers.yaml entry.
@@ -71,7 +52,7 @@ class Provider:
         Composes a ProviderPool: its own httpx.AsyncClient (per-provider
         connection pool), concurrency gate and drain accounting. Limits
         come from settings (global env applied per pool).
-        An optional `proxy` URL (e.g. socks5://host:port) routes all of the
+        An optional `proxy` URL (e.g. socks5://host:port) routes all of that
         provider's traffic through that proxy.
         provider_name is the providers.yaml dict key (used in logs and
         startup-validation errors).
@@ -96,13 +77,35 @@ class Provider:
             raise create_error(ErrorType.PROVIDER_CONFIG_ERROR,
                              error_details="Provider base_url is not configured.",
                              provider_name=self.provider_name)
-        self.headers = _auth_headers(entry, self.api_key, self.provider_name)
+        headers = dict(entry.headers or {})
+        headers.setdefault("Content-Type", "application/json")
+        self.headers = {**headers, **self._auth_headers()}
 
         # ARCH: the httpx pool is a composed component (providers/pool.py), not a
         # base-class role — client construction, the concurrency gate and the
         # graceful-drain invariants live there, directly testable.
         self.pool = ProviderPool(settings=settings, provider_name=self.provider_name,
                                  proxy=self.proxy, max_concurrent=entry.max_concurrent)
+
+    def _auth_headers(self) -> dict[str, str]:
+        """This protocol's credential headers, built once in __init__.
+
+        The OpenAI-compatible wire carries its key as a Bearer Authorization;
+        subclasses speaking another protocol override this (AnthropicProvider
+        sends x-api-key). Static checks on entry.headers already ran in
+        parse_provider; only the env-dependent one (the api_key_env variable
+        is set) runs here.
+
+        Raises:
+            HTTPException: If api_key_env names an unset environment variable.
+        """
+        if not self.api_key_env:
+            return {}
+        if not self.api_key:
+            raise create_error(ErrorType.PROVIDER_CONFIG_ERROR,
+                             error_details=f"API key for {self.api_key_env} is not set in environment variables.",
+                             provider_name=self.provider_name)
+        return {"Authorization": f"Bearer {self.api_key}"}
 
     async def aclose(self, drain_timeout: float | None = None) -> None:
         """Close the owned pool once in-flight requests have drained.
@@ -208,19 +211,20 @@ class Provider:
 
         ARCH: shared by the stream and non-stream paths so both send an
         identical header set — a diverging set is itself a fingerprint.
-        Authorization is never overwritten (INVARIANT above the class);
-        case-insensitive duplicates of extra keys replace their base
-        counterparts instead of being sent twice.
+        The credential headers (Authorization / x-api-key — see the INVARIANT
+        above the class) are never overwritten; case-insensitive duplicates of
+        extra keys replace their base counterparts instead of being sent twice.
         """
         merged = dict(self.headers)
         if not extra_headers:
             return merged
-        # WHY: authorization is not replaceable, so it must also survive the
+        # WHY: credentials are not replaceable, so they must also survive the
         # case-insensitive duplicate elimination below.
-        extra_lower = {name.lower() for name in extra_headers} - {"authorization"}
+        protected = {"authorization", "x-api-key"}
+        extra_lower = {name.lower() for name in extra_headers} - protected
         merged = {k: v for k, v in merged.items() if k.lower() not in extra_lower}
         for name, value in extra_headers.items():
-            if name.lower() == "authorization":
+            if name.lower() in protected:
                 continue
             merged[name] = value
         return merged

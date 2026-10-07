@@ -137,7 +137,7 @@ _OLD_SCHEMA = """
 
 _NEW_COLUMNS = {
     "error_code", "error_message", "api_key_hash", "client_ip",
-    "reasoning_tokens", "cost_usd", "has_usage", "stream",
+    "reasoning_tokens", "cost_usd", "has_usage", "stream", "cache_write_tokens",
 }
 
 
@@ -250,6 +250,57 @@ class TestSetUsage:
         assert RequestStats().has_usage is False
 
 
+class TestSetAnthropicUsage:
+    """set_anthropic_usage — the single extraction point for the Anthropic
+    Messages usage shape (input/output + cache read/creation)."""
+
+    def test_full_arithmetic(self):
+        stats = RequestStats()
+        stats.set_anthropic_usage({
+            "input_tokens": 25, "output_tokens": 12,
+            "cache_read_input_tokens": 64, "cache_creation_input_tokens": 128,
+        })
+        assert stats.prompt_tokens == 25 + 64 + 128
+        assert stats.cached_tokens == 64
+        assert stats.cache_write_tokens == 128
+        assert stats.completion_tokens == 12
+        assert stats.total_tokens == 25 + 64 + 128 + 12
+        assert stats.has_usage is True
+
+    def test_missing_cache_keys_default_zero(self):
+        stats = RequestStats()
+        stats.set_anthropic_usage({"input_tokens": 5, "output_tokens": 2})
+        assert stats.prompt_tokens == 5
+        assert stats.cached_tokens == 0
+        assert stats.cache_write_tokens == 0
+        assert stats.total_tokens == 7
+        assert stats.has_usage is True
+
+    def test_none_usage_tolerated(self):
+        stats = RequestStats()
+        stats.set_anthropic_usage({})
+        assert stats.has_usage is True
+        assert stats.prompt_tokens == 0
+
+
+class TestSetUsageCacheWrite:
+    """set_usage also reads the OpenRouter-reported cache write."""
+
+    def test_openrouter_cache_write_tokens_read(self):
+        stats = RequestStats()
+        stats.set_usage({
+            "prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110,
+            "prompt_tokens_details": {"cached_tokens": 40, "cache_write_tokens": 30},
+        })
+        assert stats.cached_tokens == 40
+        assert stats.cache_write_tokens == 30
+
+    def test_absent_details_leave_zero(self):
+        stats = RequestStats()
+        stats.set_usage({"prompt_tokens": 10, "total_tokens": 10})
+        assert stats.cache_write_tokens == 0
+
+
 class TestRequestStatsAccessor:
 
     def test_returns_holder_from_request_state(self):
@@ -351,6 +402,31 @@ class TestComputeCost:
                                 "input_cache_read": "x"})
         assert writer._compute_cost_usd(stats, state) is None
 
+    def test_cache_write_tokens_use_write_rate(self):
+        """(prompt - cached - cache_write) * prompt + cached * read +
+        cache_write * write + completion * completion."""
+        stats = RequestStats(prompt_tokens=1000, completion_tokens=100,
+                             cached_tokens=200, cache_write_tokens=300)
+        state = pricing_lookup({"prompt": 1e-6, "completion": 2e-6,
+                                "input_cache_read": 0.1e-6, "input_cache_write": 1.25e-6})
+        cost = writer._compute_cost_usd(stats, state)
+        assert cost == pytest.approx(500 * 1e-6 + 200 * 0.1e-6 + 300 * 1.25e-6
+                                     + 100 * 2e-6)
+
+    def test_missing_input_cache_write_falls_back_to_prompt_rate(self):
+        """Same rule and WHY as input_cache_read: an absent cache-write rate
+        must not be treated as free."""
+        stats = RequestStats(prompt_tokens=1000, completion_tokens=0, cache_write_tokens=400)
+        state = pricing_lookup({"prompt": 1e-6, "completion": 2e-6})
+        cost = writer._compute_cost_usd(stats, state)
+        assert cost == pytest.approx(1000 * 1e-6)
+
+    def test_non_numeric_cache_write_rate_returns_none(self):
+        stats = RequestStats(prompt_tokens=10, completion_tokens=0, cache_write_tokens=4)
+        state = pricing_lookup({"prompt": 1e-6, "completion": 2e-6,
+                                "input_cache_write": "x"})
+        assert writer._compute_cost_usd(stats, state) is None
+
 
 # ---------------------------------------------------------------------------
 # Flush
@@ -406,6 +482,19 @@ class TestFlushRow:
         assert row["cost_usd"] == pytest.approx(100 * 1e-6 + 40 * 2e-6)
         assert row["error_code"] is None
         assert row["error_message"] is None
+
+    @pytest.mark.asyncio
+    async def test_cache_write_tokens_column_written(self, db):
+        stats = RequestStats(endpoint="messages", model_id="m", provider_name="p")
+        stats.set_anthropic_usage({"input_tokens": 10, "output_tokens": 4,
+                                   "cache_read_input_tokens": 5,
+                                   "cache_creation_input_tokens": 2})
+        await flush(stats, request_id="r-cw", project_name="proj", status_code=200)
+
+        row = (await fetch_rows(db))[0]
+        assert row["cache_write_tokens"] == 2
+        assert row["cached_tokens"] == 5
+        assert row["prompt_tokens"] == 17
 
     @pytest.mark.asyncio
     async def test_error_message_truncated_to_500(self, db):

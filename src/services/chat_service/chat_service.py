@@ -19,6 +19,7 @@ class ChatService(BaseService):
         prepared = await self._prepare_dispatch(
             request, auth_context,
             component="chat_service", log_title="Chat Completion Request JSON",
+            api="openai-completions",
         )
 
         async with self._guard_service_errors(prepared.error_ctx):
@@ -52,10 +53,10 @@ class ChatService(BaseService):
         processor."""
         prepared.stats.stream = True
         # INVARIANT: a streaming chat request asks the upstream for usage unless
-        # the client set stream_options itself; models.yaml options still
-        # override it at merge time.
-        # Why: llama-server emits the usage frame only when asked and harnesses do
-        # not ask, so every such stream was recorded with zero tokens and no cost.
+        # the client set stream_options itself (models.yaml options still win).
+        # Why: llama-server emits the usage frame only when asked and harnesses
+        # do not ask, so every such stream was recorded with zero tokens and
+        # no cost.
         if "stream_options" not in prepared.request_body:
             prepared.request_body["stream_options"] = {"include_usage": True}
         provider_stream = prepared.provider.chat_completions_stream(

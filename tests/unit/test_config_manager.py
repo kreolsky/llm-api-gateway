@@ -239,11 +239,23 @@ class TestHardValidationVeto:
     def test_unknown_provider_type_refuses_to_start(self):
         from src.core.config_schema import ConfigError
         file_map = {**ALL_YAMLS,
-                    "providers.yaml": "providers:\n  p:\n    type: anthropic\n    base_url: https://x\n"}
+                    "providers.yaml": "providers:\n  p:\n    type: bedrock\n    base_url: https://x\n"}
         with pytest.raises(ConfigError) as exc_info:
             _build_config_manager(file_map)
         assert "providers.p" in str(exc_info.value)
-        assert "anthropic" in str(exc_info.value)
+        assert "bedrock" in str(exc_info.value)
+
+    def test_anthropic_provider_type_parses(self):
+        """`type: anthropic` is a known second protocol, not a startup refusal."""
+        file_map = {**ALL_YAMLS,
+                    "providers.yaml": ("providers:\n  claude:\n    type: anthropic\n"
+                                       "    base_url: https://api.anthropic.com\n"
+                                       "    api_key_env: ANTHROPIC_API_KEY\n")}
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-x"}, clear=False):
+            cm = _build_config_manager(file_map)
+        entry = cm.get_config().providers["claude"]
+        assert entry.type == "anthropic"
+        assert entry.base_url == "https://api.anthropic.com"
 
     @pytest.mark.asyncio
     async def test_bad_dialect_vetoes_reload_and_keeps_old_config(self):
@@ -313,6 +325,50 @@ class TestMaxConcurrentValidation:
             })
         assert "providers.orange" in str(exc_info.value)
         assert "max_concurrent" in str(exc_info.value)
+
+
+class TestModelInfoCompat:
+    """model_info `compat` (manual-only pi-ai compat flags, rendered as stored):
+    a mapping of string keys to bool/str/int scalars; anything else is warned
+    about and dropped, soft like the other model_info keys."""
+
+    def _model_info_config(self, compat):
+        from src.core.config_schema import parse_config
+        return parse_config({
+            "providers": {"p": {"type": "openai"}},
+            "models": {"m": {"provider": "p"}},
+            "model_info": {"m": {"compat": compat}},
+        })
+
+    def test_scalar_compat_kept_verbatim(self):
+        with patch("src.core.config_schema.logger") as mock_logger:
+            config = self._model_info_config({"forceAdaptiveThinking": True,
+                                              "supportsMidConvoEffort": True,
+                                              "title": "deep thinker", "rank": 2})
+        assert config.model_info["m"]["compat"] == {
+            "forceAdaptiveThinking": True, "supportsMidConvoEffort": True,
+            "title": "deep thinker", "rank": 2,
+        }
+        mock_logger.warning.assert_not_called()
+
+    def test_non_scalar_values_dropped_with_warning(self):
+        with patch("src.core.config_schema.logger") as mock_logger:
+            config = self._model_info_config({"ok": True, "bad-list": [1], "bad-dict": {},
+                                              "bad-none": None})
+        assert config.model_info["m"]["compat"] == {"ok": True}
+        warnings = [c[0][0] for c in mock_logger.warning.call_args_list]
+        assert any("compat" in w and "bad-list" in w for w in warnings)
+
+    def test_non_string_key_dropped(self):
+        with patch("src.core.config_schema.logger"):
+            config = self._model_info_config({"ok": 1, 3: "int key"})
+        assert config.model_info["m"]["compat"] == {"ok": 1}
+
+    def test_non_mapping_compat_dropped_with_warning(self):
+        with patch("src.core.config_schema.logger") as mock_logger:
+            config = self._model_info_config(["flag"])
+        assert "compat" not in config.model_info["m"]
+        assert mock_logger.warning.called
 
 
 class TestCrossReferenceWarnings:

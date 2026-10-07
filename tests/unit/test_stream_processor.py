@@ -7,7 +7,11 @@ import pytest
 from fastapi import HTTPException
 
 from src.core.usage_db import RequestStats
-from src.services.chat_service.stream_processor import duplicate_reasoning_field, process_stream
+from src.services.chat_service.stream_processor import (
+    ANTHROPIC_STREAM,
+    duplicate_reasoning_field,
+    process_stream,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -331,6 +335,130 @@ _LLAMA_ERROR_FRAME = sse(json.dumps({"error": {
                "the peg-native format",
     "type": "server_error",
 }}))
+
+
+# ---------------------------------------------------------------------------
+# 12. Anthropic wire (ANTHROPIC_STREAM): byte-identical frames, usage capture
+# ---------------------------------------------------------------------------
+
+_MESSAGE_START = (
+    'event: message_start\n'
+    'data: {"type":"message_start","message":{"id":"msg_1","type":"message","usage":'
+    '{"input_tokens":25,"output_tokens":1,"cache_creation_input_tokens":0,'
+    '"cache_read_input_tokens":0}}}\n\n'
+)
+_THINKING_DELTA = (
+    'event: content_block_delta\n'
+    'data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta",'
+    '"thinking":"Hmm"}}\n\n'
+)
+_TEXT_DELTA = (
+    'event: content_block_delta\n'
+    'data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta",'
+    '"text":"Hi there"}}\n\n'
+)
+_MESSAGE_DELTA = (
+    'event: message_delta\n'
+    'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":'
+    '{"input_tokens":25,"output_tokens":12,"cache_creation_input_tokens":128,'
+    '"cache_read_input_tokens":64}}\n\n'
+)
+_MESSAGE_STOP = 'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+
+_DEEPSEEK_ANTHROPIC_FRAMES = [
+    _MESSAGE_START.encode(), _THINKING_DELTA.encode(), _TEXT_DELTA.encode(),
+    _MESSAGE_DELTA.encode(), _MESSAGE_STOP.encode(),
+]
+
+
+class TestAnthropicWire:
+    """The DeepSeek anthropic-wire frames observed during planning, passed
+    through byte-identically, with usage captured from message_start and
+    message_delta and recorded via set_anthropic_usage."""
+
+    def _run(self, chunks, stats=None):
+        return collect(process_stream(
+            async_gen(chunks), "m", "r", "u", "p",
+            stats=stats or RequestStats(), wire=ANTHROPIC_STREAM))
+
+    @pytest.mark.asyncio
+    async def test_frames_pass_byte_identical_and_usage_recorded(self):
+        stats = RequestStats(model_id="m", provider_name="p")
+        result = await self._run(_DEEPSEEK_ANTHROPIC_FRAMES, stats)
+
+        assert b"".join(result) == b"".join(_DEEPSEEK_ANTHROPIC_FRAMES)
+        # merged (later wins): input 25, output 12 (delta over start's 1),
+        # cache_read 64, cache_creation 128
+        assert stats.has_usage is True
+        assert stats.prompt_tokens == 25 + 64 + 128
+        assert stats.completion_tokens == 12
+        assert stats.cached_tokens == 64
+        assert stats.cache_write_tokens == 128
+        assert stats.total_tokens == 25 + 64 + 128 + 12
+        assert stats.error_code is None
+
+    @pytest.mark.asyncio
+    async def test_usage_split_across_chunks_recorded_only_when_whole(self):
+        """Best-effort capture (documented): a data line split across chunk
+        boundaries is not parsed; the earlier whole frame's usage survives."""
+        encoded = _MESSAGE_DELTA.encode()
+        # cut at every offset INSIDE the `data: {...}` JSON line: neither
+        # chunk then carries the line whole, so the delta usage must be
+        # skipped and the message_start numbers (output 1) survive. A cut
+        # before the data line (e.g. inside "event: ...") leaves it whole in
+        # the second chunk and is correctly captured — not asserted here.
+        data_at = encoded.index(b"data: ")
+        json_end = encoded.rindex(b"}") + 1
+        for cut in range(data_at + 1, json_end):
+            stats = RequestStats()
+            chunks = [_MESSAGE_START.encode(), encoded[:cut], encoded[cut:],
+                      _MESSAGE_STOP.encode()]
+            result = await self._run(chunks, stats)
+            assert b"".join(result) == b"".join(chunks)
+            assert stats.has_usage is True
+            assert stats.completion_tokens == 1, f"cut={cut}"
+            assert stats.cache_write_tokens == 0, f"cut={cut}"
+
+    @pytest.mark.asyncio
+    async def test_no_usage_frames_leaves_stats_empty(self):
+        stats = RequestStats()
+        await self._run([_THINKING_DELTA.encode(), _MESSAGE_STOP.encode()], stats)
+        assert stats.has_usage is False
+
+    @pytest.mark.asyncio
+    async def test_mid_stream_failure_frames_anthropic_error_without_done(self):
+        """A router-side mid-stream failure answers an Anthropic error event,
+        with no [DONE] sentinel (that is an OpenAI-wire convention)."""
+        stats = RequestStats(model_id="m", provider_name="p", stream=True)
+
+        async def gen():
+            yield _MESSAGE_START.encode()
+            raise HTTPException(
+                status_code=429,
+                detail={"error": {"code": 429, "message": "rate limited",
+                                  "metadata": {"error_code": "provider_http_error"}}},
+            )
+
+        result = b"".join(await collect(
+            process_stream(gen(), "m", "r", "u", "p", stats=stats, wire=ANTHROPIC_STREAM)))
+        assert result.startswith(_MESSAGE_START.encode())
+        tail = result[len(_MESSAGE_START):]
+        assert tail.startswith(b"event: error\n")
+        assert b"[DONE]" not in tail
+        payload = json.loads(tail.decode().split("data: ", 1)[1].split("\n\n")[0])
+        assert payload == {"type": "error",
+                           "error": {"type": "rate_limit_error", "message": "rate limited"}}
+        assert stats.error_code == "provider_http_error"
+
+    @pytest.mark.asyncio
+    async def test_openai_default_wire_unchanged(self):
+        """process_stream without wire= keeps the OpenAI capture and frame."""
+        usage = {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}
+        stats = RequestStats()
+        result = await collect(process_stream(
+            async_gen([sse(json.dumps({"usage": usage}))]), "m", "r", "u", "p", stats=stats))
+        assert stats.has_usage is True and stats.total_tokens == 10
+        assert result == [sse(json.dumps({"usage": usage}))]
 
 
 # ---------------------------------------------------------------------------

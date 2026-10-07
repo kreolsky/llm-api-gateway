@@ -123,6 +123,7 @@ from fastapi.routing import APIRoute  # noqa: E402
 # The stored endpoint values (usage rows group by them — legacy strings).
 EXPECTED_ENDPOINT_NAMES = {
     "/v1/chat/completions": "chat",
+    "/v1/messages": "messages",
     "/v1/embeddings": "embeddings",
     "/v1/audio/transcriptions": "transcriptions",
     "/v1/models": "models",
