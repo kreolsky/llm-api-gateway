@@ -21,6 +21,8 @@
 #       tokenizer: str                     # optional
 #       instruct_type: str                 # optional
 #     supported_parameters: [tools, tool_choice, max_tokens, temperature, top_p, stream]
+#                                          # response_format = accepts json_object; structured_outputs =
+#                                          # accepts json_schema strict (Lore's extractor lists only these)
 #     reasoning:
 #       supported: bool                     # auto-derived from upstream supported_parameters
 #       default_enabled: bool               # manual only — no upstream shape expresses it
