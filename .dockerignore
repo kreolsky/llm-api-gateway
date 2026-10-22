@@ -15,3 +15,5 @@ docs/
 .venv/
 venv/
 .claude/
+# WHY: config is mounted at /app/config, never baked — an image without the mount refuses to start.
+config/

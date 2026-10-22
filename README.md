@@ -77,6 +77,16 @@ A self-hosted, OpenAI-compatible API gateway: one endpoint and one key per clien
 
 `config/` and `src/` are bind-mounted: config edits apply within `CONFIG_RELOAD_INTERVAL` seconds; code edits need `docker compose restart api`; only `requirements.txt` or `Dockerfile` changes need `docker compose up -d --build`.
 
+### Prebuilt image
+
+Each release tag publishes `ghcr.io/kreolsky/llm-api-gateway:<X.Y.Z>` and `:stable`. The image carries **no config**: mount your `config/` at `/app/config` and pass provider keys as env vars — without the mount the router refuses to start with `Critical config file missing`. Keep `/app/data` on a named volume (usage database).
+
+```bash
+docker run -d -p 8777:8000 --env-file .env \
+  -v "$PWD/config:/app/config" -v router-usage:/app/data \
+  ghcr.io/kreolsky/llm-api-gateway:stable
+```
+
 ### Running a second instance
 
 Copy the repository to another directory, give it its own `.env` and `config/`, then change two things in its `docker-compose.yml`:
