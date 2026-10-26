@@ -53,6 +53,10 @@ models:
     provider: embedding
     provider_model_name: dummy
     is_hidden: true
+  rerank/dummy:
+    provider: rerank
+    provider_model_name: dummy
+    is_hidden: true
   stt/dummy:
     provider: transcriber
     provider_model_name: dummy

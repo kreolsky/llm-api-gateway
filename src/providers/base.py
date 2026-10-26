@@ -583,6 +583,25 @@ class Provider:
             request_id=request_id
         )
 
+    async def rerank(self, request_body: dict[str, Any], provider_model_name: str,
+                     model_config: ModelEntry, request_id: str = "unknown",
+                     extra_headers: dict[str, str] = None) -> Any:
+        """Forward a rerank request to a /rerank endpoint (llama-server, Jina/Cohere shape)."""
+        request_body = self._apply_model_config(request_body, provider_model_name, model_config)
+
+        # WHY: rerank is the embeddings class of call (one forward pass over
+        # short inputs), so it shares that read cap instead of a setting of its own.
+        rerank_timeout = self._create_timeout(read=self.settings.openai_embeddings_read_timeout)
+
+        return await self._request(
+            method="POST",
+            path="/rerank",
+            request_body=request_body,
+            extra_headers=extra_headers,
+            timeout=rerank_timeout,
+            request_id=request_id
+        )
+
     async def list_models(self, request_id: str = "unknown") -> dict[str, Any]:
         """Return the provider's /models list (raw response)."""
         return await self._request(

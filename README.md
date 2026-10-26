@@ -38,6 +38,7 @@ A self-hosted, OpenAI-compatible API gateway: one endpoint and one key per clien
 - `POST /v1/chat/completions` — chat completion (streaming + non-streaming), for models on `openai`-type providers
 - `POST /v1/messages` — native Anthropic Messages pass-through (streaming + non-streaming), for models on `anthropic`-type providers
 - `POST /v1/embeddings` — text embeddings
+- `POST /v1/rerank` — score documents against a query (llama-server `--reranking`, Jina/Cohere shape), passed through as is
 - `POST /v1/audio/transcriptions` — speech-to-text (model optional, fallback to `DEFAULT_STT_MODEL`)
 - `GET /stat/` — token usage dashboard (HTML); backed by `/stat/api/users`, `/stat/api/models`, `/stat/api/usage`, `/stat/api/summary`, `/stat/api/requests` (guarded by `X-Stat-Key` when `STAT_API_KEY` is set)
 
@@ -109,7 +110,7 @@ Any OpenAI SDK or OpenAI-compatible harness works — point it at the gateway:
 - **Reasoning.** Send `reasoning_effort` (or `thinking: {"type": "enabled" | "disabled"}`) as you would to OpenAI or DeepSeek; the gateway re-shapes it for the provider that actually serves the model. `GET /v1/capabilities` returns `{model_id: {supported, effort_levels}}`; a value outside `effort_levels` is a 400 `invalid_parameter_value`, never silently clamped.
 - **Errors.** Every error has one shape: `{"error": {"code", "message", "metadata"}}` (OpenRouter-compatible); provider errors add `metadata.provider_name` and `metadata.raw`. The exception is `/v1/messages`, below.
 - **Anthropic SDK clients.** Point the SDK's base URL at `http://<host>:8777` (the SDK appends `/v1/messages`) and pass the gateway key as its API key. The gateway checks the key and model access, rewrites only `model` to the provider's name, and forwards the body and SSE stream byte-for-byte; `anthropic-version` / `anthropic-beta` are forwarded (default `anthropic-version: 2023-06-01`). Gateway-made errors are Anthropic-shaped — `{"type": "error", "error": {"type", "message"}}`, and a mid-stream failure is an `event: error` frame. Calling a model over the other protocol's endpoint is a 400 `wrong_api`. The model's `reasoning_effort` policy is advertised in `/v1/capabilities` but not enforced on this path.
-- **Other endpoints.** `POST /v1/embeddings`, and `POST /v1/audio/transcriptions` (multipart; `model` is optional and falls back to `DEFAULT_STT_MODEL`).
+- **Other endpoints.** `POST /v1/embeddings`, `POST /v1/rerank`, and `POST /v1/audio/transcriptions` (multipart; `model` is optional and falls back to `DEFAULT_STT_MODEL`).
 
 ## How It Works
 
@@ -152,7 +153,7 @@ A local server with no auth simply omits `api_key_env`:
 
 `reasoning_dialect` re-shapes the client's `thinking` / `reasoning_effort` fields for the upstream family (`src/services/reasoning_dialect.py`); an unknown value fails startup validation.
 
-`type` is the protocol the provider speaks, and therefore the endpoint its models are served on: `openai` — any OpenAI-compatible API, on `/v1/chat/completions`, `/v1/embeddings`, `/v1/audio/transcriptions`; `anthropic` — the native Anthropic Messages API (`POST {base_url}/v1/messages`), on `/v1/messages`. A provider speaks exactly one protocol, so a vendor offering both is two entries sharing one key:
+`type` is the protocol the provider speaks, and therefore the endpoint its models are served on: `openai` — any OpenAI-compatible API, on `/v1/chat/completions`, `/v1/embeddings`, `/v1/rerank`, `/v1/audio/transcriptions`; `anthropic` — the native Anthropic Messages API (`POST {base_url}/v1/messages`), on `/v1/messages`. A provider speaks exactly one protocol, so a vendor offering both is two entries sharing one key:
 
 ```yaml
   deepseek-anthropic:

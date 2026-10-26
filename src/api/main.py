@@ -28,6 +28,7 @@ from ..services.chat_service.chat_service import ChatService
 from ..services.embedding_service import EmbeddingService
 from ..services.messages_service import MessagesService
 from ..services.model_service import ModelService
+from ..services.rerank_service import RerankService
 from ..services.transcription_service import TranscriptionService
 from .middleware import RequestLoggerMiddleware
 from .stat_page import STATIC_DIR, stat_page
@@ -96,6 +97,7 @@ async def lifespan(app: FastAPI):
     app.state.model_service = ModelService(config_manager, registry, capabilities_cache)
     app.state.chat_service = ChatService(config_manager, registry)
     app.state.embedding_service = EmbeddingService(config_manager, registry)
+    app.state.rerank_service = RerankService(config_manager, registry)
     app.state.transcription_service = TranscriptionService(config_manager, registry)
     app.state.messages_service = MessagesService(config_manager, registry)
 
@@ -261,6 +263,13 @@ async def create_embeddings(
     auth_context: AuthContext = Depends(check_endpoint_access("/v1/embeddings"))
 ):
     return await app.state.embedding_service.create_embeddings(request, auth_context)
+
+@app.post("/v1/rerank", name="rerank")
+async def rerank(
+    request: Request,
+    auth_context: AuthContext = Depends(check_endpoint_access("/v1/rerank"))
+):
+    return await app.state.rerank_service.rerank(request, auth_context)
 
 @app.post("/v1/audio/transcriptions", name="transcriptions")
 async def create_transcription(

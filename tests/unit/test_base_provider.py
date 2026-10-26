@@ -997,6 +997,18 @@ class TestChatExtraHeadersForwarding:
         assert provider._request.call_args.kwargs["extra_headers"] == extra
 
     @pytest.mark.asyncio
+    async def test_rerank_forwards_extra_headers(self):
+        provider = _build_openai_provider()
+        provider._request = AsyncMock(return_value={"results": []})
+        extra = {"user-agent": "Kilo-Code/7.5.5"}
+        await provider.rerank({"query": "q", "documents": ["d"]}, "rr", NO_OPTIONS,
+                              request_id="r1", extra_headers=extra)
+        kwargs = provider._request.call_args.kwargs
+        assert kwargs["extra_headers"] == extra
+        assert kwargs["path"] == "/rerank"
+        assert kwargs["request_body"]["model"] == "rr"
+
+    @pytest.mark.asyncio
     async def test_transcriptions_forwards_extra_headers(self):
         provider = _build_openai_provider()
         provider._request = AsyncMock(return_value={"text": "ok"})
@@ -1095,6 +1107,20 @@ class TestCallSiteTimeouts:
         assert t.connect == 60.0
         assert t.pool == 5.0
         assert t.write == provider.pool.client.timeout.write
+
+    @pytest.mark.asyncio
+    async def test_rerank_read_is_embeddings_read_timeout(self):
+        """Rerank is the embeddings class of call — it shares that read cap."""
+        settings = _make_settings(httpx_connect_timeout=60.0, httpx_read_timeout=60.0,
+                      httpx_pool_timeout=5.0, openai_embeddings_read_timeout=30.0)
+        provider, captured = self._openai_provider(settings)
+
+        await provider.rerank({"query": "q", "documents": ["d"]}, "m", NO_OPTIONS)
+
+        t = captured["timeout"]
+        assert t.read == 30.0
+        assert t.connect == 60.0
+        assert t.pool == 5.0
 
     @pytest.mark.asyncio
     async def test_stream_read_is_stream_read_timeout(self):
