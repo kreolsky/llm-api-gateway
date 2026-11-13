@@ -1,9 +1,17 @@
-# Publish the router image to ghcr on a release tag: :X.Y.Z and :stable.
+# Publish a release tag: the router image to ghcr (:X.Y.Z and :stable) and a GitHub Release
+# whose body is the tag's docs/release note. Manual run = (re)create the Release of an
+# existing tag (backfill or a failed run); it never rebuilds the image. Each new Release is
+# marked Latest, so backfill oldest tag first.
 name: publish
 
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to create the GitHub Release for (e.g. v1.3.0)"
+        required: true
 
 permissions:
   contents: read
@@ -11,6 +19,7 @@ permissions:
 
 jobs:
   image:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -31,3 +40,22 @@ jobs:
           tags: |
             ghcr.io/kreolsky/llm-api-gateway:${{ steps.tag.outputs.version }}
             ghcr.io/kreolsky/llm-api-gateway:stable
+
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      # WHY: checkout of the TAG — the release skill commits the note before tagging, so
+      # the tagged tree always carries its own note, on a push and on a manual run alike.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - run: |
+          note=$(ls docs/release/release-*-"${TAG}".md)
+          # The H1 repeats the Release title; the body starts after it.
+          tail -n +2 "$note" > "$RUNNER_TEMP/notes.md"
+          gh release create "$TAG" --verify-tag --title "$TAG" --notes-file "$RUNNER_TEMP/notes.md"

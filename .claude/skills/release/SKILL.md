@@ -82,5 +82,6 @@ git rev-parse "$VER^{}" origin/main                       # both lines are $REL
 ## Output
 
 Version tag (and the overridden recommendation, if any), note path, commit count, the new
-`origin/main` SHA — and that prod is NOT updated until `deploy-server` runs, after which
+`origin/main` SHA, the GitHub Release page of the tag (created by the `release` job of
+`.github/workflows/publish.yml` from the note; missing ⇒ re-run it by hand with `tag:`) — and that prod is NOT updated until `deploy-server` runs, after which
 `/health` on the server reports `vX.Y.Z`.
