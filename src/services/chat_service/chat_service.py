@@ -20,11 +20,17 @@ class ChatService(BaseService):
             request, auth_context,
             component="chat_service", log_title="Chat Completion Request JSON",
             api="openai-completions",
+            # anthropic-type models are served here non-streaming, translated
+            # by AnthropicProvider.chat_completions.
+            nonstream_also_api="anthropic-messages",
         )
 
         async with self._guard_service_errors(prepared.error_ctx):
             if prepared.request_body.get("stream", False):
                 return await self._stream_response(prepared)
+
+            if prepared.provider.entry.type == "anthropic":
+                self._default_max_tokens(prepared)
 
             response_data = await prepared.provider.chat_completions(
                 prepared.request_body, prepared.provider_model_name, prepared.model_config,
@@ -46,6 +52,23 @@ class ChatService(BaseService):
                 prepared.stats.set_usage(usage)
 
             return JSONResponse(content=response_data)
+
+    def _default_max_tokens(self, prepared: PreparedDispatch) -> None:
+        """Fill max_tokens from the model's declared output limit when the
+        client sent neither limit.
+
+        WHY: the Messages wire refuses a request without max_tokens while the
+        chat-completions wire makes it optional. The limit is read from
+        model_info.yaml — the auto-cache does not fill it for anthropic
+        backends, and the config load already warns when it is missing.
+        """
+        body = prepared.request_body
+        if body.get("max_tokens") or body.get("max_completion_tokens"):
+            return
+        info = self.config_manager.get_config().model_info.get(prepared.requested_model) or {}
+        limit = info.get("max_completion_tokens")
+        if isinstance(limit, int):
+            body["max_tokens"] = limit
 
     async def _stream_response(self, prepared: PreparedDispatch) -> StreamingResponse:
         """Stream branch of chat_completions: ask the upstream for usage, open

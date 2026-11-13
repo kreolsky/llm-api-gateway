@@ -181,6 +181,7 @@ class BaseService:
         model_id: Any,
         *,
         api: str,
+        also_api: str | None = None,
     ) -> ResolvedTarget:
         """Body-agnostic dispatch funnel: enrich stats, validate access,
         resolve the provider, enforce the protocol gate, and build the
@@ -208,7 +209,7 @@ class BaseService:
         if not model_id:
             raise create_error(ErrorType.MODEL_NOT_SPECIFIED, **error_ctx)
         model_config, provider_instance = self._resolve_provider(
-            model_id, auth_context, api, error_ctx)
+            model_id, auth_context, api, error_ctx, also_api=also_api)
         stats.provider_name = model_config.provider
 
         identity_headers = self._build_identity_headers(provider_instance, request)
@@ -226,6 +227,8 @@ class BaseService:
         auth_context: AuthContext,
         api: str,
         error_ctx: dict[str, Any],
+        *,
+        also_api: str | None = None,
     ) -> tuple[ModelEntry, Provider]:
         """resolve_model + registry lookup + the protocol gate.
 
@@ -234,7 +237,9 @@ class BaseService:
         AFTER resolve_model (access before existence stays intact) the
         provider instance's type is checked against it, so a model is only
         ever dispatched over the protocol its provider speaks — by
-        construction, for every endpoint.
+        construction, for every endpoint. ``also_api`` is a second protocol
+        the caller can translate to (the non-streaming chat path, see
+        _prepare_dispatch); None everywhere else keeps the gate strict.
         """
         model_config = self.resolve_model(model_id, auth_context, **error_ctx)
         provider_instance = self.registry.get(model_config.provider)
@@ -245,7 +250,7 @@ class BaseService:
         # backend actually called; the instance's entry is the one it was built
         # from (same rule as the reasoning dialect in _prepare_dispatch).
         protocol = PROTOCOL_BY_PROVIDER_TYPE[provider_instance.entry.type]
-        if protocol.api != api:
+        if protocol.api not in (api, also_api):
             raise create_error(ErrorType.WRONG_API, expected_path=protocol.path, **error_ctx)
         return model_config, provider_instance
 
@@ -257,14 +262,14 @@ class BaseService:
         component: str,
         log_title: str,
         api: str,
+        nonstream_also_api: str | None = None,
     ) -> PreparedDispatch:
         """Thin JSON wrapper over _resolve_target: parse the body, log it,
         delegate, then apply the reasoning-effort policy to the parsed body.
 
         The effort policy is deliberately HERE and not in the resolver: it is
         body-shaped (reads/writes the JSON body), and multipart endpoints
-        riding the resolver must never get it. ``api`` is passed through to
-        the resolver's protocol gate unchanged.
+        riding the resolver must never get it. ``api`` reaches the gate unchanged.
         """
         request_body = await self._parse_json_request(request)
         requested_model = request_body.get("model")
@@ -273,7 +278,11 @@ class BaseService:
                           request_id=request_context(request).request_id,
                           component=component, data_flow="incoming")
 
-        target = await self._resolve_target(request, auth_context, requested_model, api=api)
+        # INVARIANT: nonstream_also_api opens the gate ONLY for a non-streaming body.
+        # Why: the provider translates one JSON response; no SSE re-framing exists.
+        also_api = None if request_body.get("stream", False) else nonstream_also_api
+        target = await self._resolve_target(request, auth_context, requested_model,
+                                            api=api, also_api=also_api)
 
         # ARCH: the effort policy rides the one dispatch funnel (services/reasoning_effort.py).
         request_body = apply_reasoning_effort(request_body, target.model_config.effort_policy,

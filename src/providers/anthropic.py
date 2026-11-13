@@ -6,6 +6,7 @@ from typing import Any
 
 from ..core.config_schema import ModelEntry
 from ..core.error_handling import ErrorType, create_error
+from .anthropic_translate import chat_to_messages, messages_to_chat
 from .base import Provider
 
 ANTHROPIC_VERSION = "2023-06-01"
@@ -60,6 +61,23 @@ class AnthropicProvider(Provider):
             timeout=timeout,
             request_id=request_id,
         )
+
+    async def chat_completions(self, request_body: dict[str, Any], provider_model_name: str,
+                               model_config: ModelEntry, request_id: str = "unknown",
+                               extra_headers: dict[str, str] = None) -> dict[str, Any]:
+        """Serve a NON-streaming chat completion over the Messages wire.
+
+        Translates the body (anthropic_translate.chat_to_messages), sends it
+        through this provider's own ``messages`` and translates the answer
+        back; the response's usage is OpenAI-shaped under the router's
+        prompt_tokens convention. The streaming sibling is not overridden:
+        the protocol gate refuses a streaming request for this provider type.
+        """
+        requested_model = request_body.get("model") or provider_model_name
+        messages_body = chat_to_messages(request_body, request_id=request_id)
+        response = await self.messages(messages_body, provider_model_name, model_config,
+                                       request_id=request_id, extra_headers=extra_headers)
+        return messages_to_chat(response, requested_model)
 
     def messages_stream(self, request_body: dict[str, Any], provider_model_name: str,
                         model_config: ModelEntry, request_id: str = "unknown",

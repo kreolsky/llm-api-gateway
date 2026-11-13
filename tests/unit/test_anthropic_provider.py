@@ -146,6 +146,36 @@ class TestMessages:
         assert len(calls) == 2
 
 
+class TestChatCompletionsOverMessages:
+    """Non-streaming chat completions served over the Messages wire."""
+
+    @pytest.mark.asyncio
+    async def test_translates_both_ways_through_messages(self):
+        provider = _build_provider()
+        provider._request = AsyncMock(return_value={
+            "id": "msg_1", "type": "message", "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": "{}"}],
+            "usage": {"input_tokens": 3, "output_tokens": 2},
+        })
+        model_config = ModelEntry(provider=None, options={"max_tokens": 64})
+        body = {"model": "claude/sonnet", "temperature": 0,
+                "messages": [{"role": "system", "content": "S"},
+                             {"role": "user", "content": "hi"}]}
+
+        result = await provider.chat_completions(body, "claude-real", model_config,
+                                                 request_id="r1")
+
+        call = provider._request.call_args
+        assert call.kwargs["path"] == "/v1/messages"
+        # options (Messages-wire) merge AFTER translation; model rewritten
+        assert call.kwargs["request_body"] == {
+            "model": "claude-real", "system": "S", "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}]}
+        assert result["model"] == "claude/sonnet"
+        assert result["choices"][0]["message"]["content"] == "{}"
+        assert result["usage"]["prompt_tokens"] == 3
+
+
 class TestHeaderMerge:
 
     def test_extra_headers_cannot_replace_x_api_key(self):

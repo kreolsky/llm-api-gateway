@@ -632,6 +632,45 @@ class TestProtocolGate:
         mock_get.assert_not_called()
 
 
+class TestNonStreamChatOverAnthropic:
+    """The one opening in the protocol gate: /v1/chat/completions serves an
+    anthropic-type model when the body is non-streaming (the provider
+    translates); a stream and every other endpoint stay strict."""
+
+    async def _prepare(self, registry, mock_get, body, **kwargs):
+        mock_get.return_value = _provider_of_type("anthropic")
+        svc = _build_service(
+            models={"m": {"provider": "p"}},
+            providers={"p": {"type": "anthropic", "base_url": "https://x.example.com"}},
+            registry=registry,
+        )
+        request = _make_identity_request()
+        request.json = AsyncMock(return_value=body)
+        return await svc._prepare_dispatch(
+            request, _make_auth_context(), component="c", log_title="t",
+            api="openai-completions", **kwargs)
+
+    @pytest.mark.asyncio
+    async def test_non_stream_passes(self, registry, mock_get):
+        prepared = await self._prepare(registry, mock_get, {"model": "m"},
+                                       nonstream_also_api="anthropic-messages")
+        assert prepared.provider is mock_get.return_value
+
+    @pytest.mark.asyncio
+    async def test_stream_is_still_wrong_api(self, registry, mock_get):
+        with pytest.raises(HTTPException) as exc_info:
+            await self._prepare(registry, mock_get, {"model": "m", "stream": True},
+                                nonstream_also_api="anthropic-messages")
+        assert exc_info.value.detail["error"]["metadata"]["error_code"] == "wrong_api"
+
+    @pytest.mark.asyncio
+    async def test_without_the_opening_non_stream_is_wrong_api(self, registry, mock_get):
+        """Embeddings (and any endpoint not passing the opening) stay strict."""
+        with pytest.raises(HTTPException) as exc_info:
+            await self._prepare(registry, mock_get, {"model": "m"})
+        assert exc_info.value.detail["error"]["metadata"]["error_code"] == "wrong_api"
+
+
 def _provider_of_type(provider_type):
     """A stand-in provider instance of the given protocol (entry carries type)."""
     return SimpleNamespace(identity=None, entry=parse_provider(
